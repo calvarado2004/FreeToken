@@ -26,7 +26,7 @@ import weakref
 import torch
 
 from freetoken.kernel.pinned import alloc_pinned_tensor
-from freetoken.utils import init_logger
+from freetoken.utils import init_logger, numa
 
 logger = init_logger(__name__)
 
@@ -141,7 +141,7 @@ def _smt_siblings_of(cores: list[int]) -> list[int]:
     return sorted(set(out))
 
 
-def physical_core_cpus() -> list[int]:
+def physical_core_cpus(numa_node: int | None = None) -> list[int]:
     """One logical CPU per physical core, restricted to this process's affinity and,
     under tensor parallelism, to this rank's share of them.
 
@@ -150,17 +150,16 @@ def physical_core_cpus() -> list[int]:
     physical core (and pinning to it) gives the best, most stable bandwidth.
     Falls back to the full affinity set when sysfs topology is unavailable.
     """
-    try:
-        allowed = sorted(os.sched_getaffinity(0))
-    except AttributeError:
-        allowed = list(range(os.cpu_count() or 1))
+    allowed = numa._allowed_cpus()
+    if numa_node is not None:
+        local = [cpu for cpu in allowed if numa.cpu_numa_node(cpu) == numa_node]
+        if local:
+            allowed = local
     reps: list[int] = []
     seen: set[str] = set()
     for cpu in allowed:
-        try:
-            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
-                key = f.read().strip()
-        except OSError:
+        key = numa.thread_siblings(cpu)
+        if key is None:
             reps.append(cpu)
             continue
         if key not in seen:
@@ -169,7 +168,9 @@ def physical_core_cpus() -> list[int]:
     return _tp_core_share(reps or allowed or [0])
 
 
-def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
+def resolve_threads_and_affinity(
+    requested: int, numa_node: int | None = None
+) -> tuple[int, list[int]]:
     """Return (num_threads, core_ids) for the worker pool.
 
     ``requested == 0`` -> one thread per physical core, pinned to it (best for the
@@ -178,18 +179,27 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     spreading first across physical cores, then across the remaining logical CPUs
     (so distinct hardware threads are used before any core is doubled up).
     """
-    reps = physical_core_cpus()
+    reps = physical_core_cpus(numa_node)
     if requested and requested > 0:
         n = int(requested)
-        # physical-core reps first, then the SMT siblings OF THOSE CORES. Taking the
-        # siblings of this rank's own cores (rather than the rest of the affinity mask)
-        # keeps an explicit thread count from spilling onto another TP rank's cores.
-        order = reps + [c for c in _smt_siblings_of(reps) if c not in set(reps)]
+        if numa.placement() is not None:
+            # TP ranks already own disjoint core slices. Never spill into a sibling
+            # rank's slice while satisfying an explicit worker count.
+            rest = [c for c in _smt_siblings_of(reps) if c not in set(reps)]
+        else:
+            rest = [c for c in numa._allowed_cpus() if c not in set(reps)]
+            if numa_node is not None:
+                rest.sort(key=lambda c: (numa.cpu_numa_node(c) != numa_node, c))
+        order = reps + rest
         if not order:
             order = [0]
         core_ids = [order[i % len(order)] for i in range(n)]
         return n, core_ids
-    return len(reps), list(reps)
+    if numa_node is None or numa.placement() is not None:
+        return len(reps), list(reps)
+    local = [c for c in numa._allowed_cpus() if numa.cpu_numa_node(c) == numa_node]
+    order = reps + [c for c in local if c not in set(reps)]
+    return len(order), order
 
 
 class CpuMoeExecutor:
@@ -265,7 +275,13 @@ class CpuMoeExecutor:
                 )
                 self._flag_sync = False
 
-        nthreads, core_ids = resolve_threads_and_affinity(num_threads)
+        pool_node = numa.moe_pool_numa_node(device)
+        nthreads, core_ids = resolve_threads_and_affinity(num_threads, pool_node)
+        if pool_node is not None:
+            logger.info_rank0(
+                f"cpu-moe pool and banks prefer NUMA node {pool_node} "
+                f"({nthreads} worker slots; FREETOKEN_CPU_MOE_NUMA=off to disable)"
+            )
         coord_core = -1
         if self._flag_sync and num_threads == 0 and nthreads > 2:
             # Auto sizing: give the coordinator the last physical core instead of
@@ -294,7 +310,12 @@ class CpuMoeExecutor:
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
 
-        spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
+        spare = (
+            len(physical_core_cpus(pool_node))
+            - nthreads
+            - (1 if coord_core >= 0 else 0)
+            - 1
+        )
         clamp = max(1, min(torch.get_num_threads(), spare))
         if clamp < torch.get_num_threads():
             logger.info_rank0(

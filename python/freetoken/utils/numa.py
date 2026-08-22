@@ -1,4 +1,4 @@
-"""NUMA topology, and how tensor-parallel ranks should be spread across it.
+"""NUMA topology, tensor-parallel rank placement, and expert-bank placement.
 
 Why an engine cares. A rank's host-side working set -- for an offload MoE, tens of GiB
 of expert banks -- is anonymous memory, so its pages land on whichever node FIRST
@@ -8,15 +8,29 @@ the interconnect. On a two-socket Xeon that is the difference between one memory
 controller and two: each socket has its own channels, so binding ranks to nodes turns
 one socket's bandwidth into the machine's.
 
-Everything here is read from sysfs and intersected with the process's affinity mask, so
-it is correct on a single-socket laptop (no-op), a 2-socket server, a 4- or 8-node
-system, and inside a container whose cpuset covers part of a node.
+Rank binding and memory placement are complementary. The former keeps each rank's
+workers near its GPU; the latter applies ``MPOL_PREFERRED`` before expert-bank pages
+are faulted in, making that locality reliable without turning a full NUMA node into
+an allocation failure. Everything degrades to a no-op on unsupported platforms.
 """
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
+import ctypes.util
+import functools
 import glob
 import os
+
+from .logger import init_logger
+
+logger = init_logger(__name__)
+
+MPOL_DEFAULT = 0
+MPOL_PREFERRED = 1
+_SYS_MBIND = {"x86_64": 237, "aarch64": 235}
+_SYS_SET_MEMPOLICY = {"x86_64": 238, "aarch64": 237}
 
 
 def _parse_cpulist(spec: str) -> set[int]:
@@ -40,6 +54,31 @@ def allowed_cpus() -> set[int]:
         return set(os.sched_getaffinity(0))
     except AttributeError:  # not Linux
         return set(range(os.cpu_count() or 1))
+
+
+def _allowed_cpus() -> list[int]:
+    """Sorted compatibility view used by CPU-MoE placement helpers and tests."""
+    return sorted(allowed_cpus())
+
+
+def cpu_numa_node(cpu: int) -> int | None:
+    """NUMA node for one logical CPU, or None where sysfs is silent."""
+    try:
+        for entry in os.listdir(f"/sys/devices/system/cpu/cpu{cpu}"):
+            if entry.startswith("node") and entry[4:].isdigit():
+                return int(entry[4:])
+    except OSError:
+        pass
+    return None
+
+
+def thread_siblings(cpu: int) -> str | None:
+    """The kernel's sibling-list string for ``cpu``, when available."""
+    try:
+        with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+            return f.read().strip()
+    except OSError:
+        return None
 
 
 def numa_nodes(allowed: set[int] | None = None) -> list[list[int]]:
@@ -88,6 +127,24 @@ def device_numa_node(device_index: int) -> int | None:
     except (OSError, ValueError):
         return None
     return node if node >= 0 else None
+
+
+def gpu_numa_node(device=None) -> int | None:
+    """NUMA node for a torch device, integer CUDA index, or current CUDA device."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        if isinstance(device, int):
+            index = device
+        else:
+            index = None if device is None else torch.device(device).index
+        if index is None:
+            index = torch.cuda.current_device()
+    except (RuntimeError, TypeError, ValueError):
+        return None
+    return device_numa_node(index)
 
 
 def rank_placement(rank: int, world_size: int) -> tuple[int, list[int], int, int] | None:
@@ -172,11 +229,162 @@ def reset_placement() -> None:
     _PLACEMENT = None
 
 
+def moe_pool_numa_node(device=None) -> int | None:
+    """Preferred node for CPU-MoE workers and expert banks.
+
+    A remembered TP rank placement wins because process affinity may already hide the
+    original multi-node topology. Outside TP, prefer the GPU-local node on a genuine
+    multi-node host. ``FREETOKEN_CPU_MOE_NUMA`` accepts ``auto`` (default), ``off``,
+    or an explicit node id.
+    """
+    setting = os.getenv("FREETOKEN_CPU_MOE_NUMA", "auto").strip().lower()
+    if setting in ("off", "none"):
+        return None
+
+    nodes = {
+        node for cpu in _allowed_cpus()
+        if (node := cpu_numa_node(cpu)) is not None
+    }
+    placed = placement()
+    if placed is not None:
+        nodes.add(placed[0])
+
+    if setting not in ("auto", ""):
+        try:
+            forced = int(setting)
+        except ValueError:
+            logger.warning(
+                f"ignoring FREETOKEN_CPU_MOE_NUMA={setting!r}: expected 'auto', "
+                "'off' or a NUMA node id"
+            )
+            return None
+        if forced not in nodes:
+            logger.warning(
+                f"FREETOKEN_CPU_MOE_NUMA={forced} has no runnable CPU; not confining"
+            )
+            return None
+        return forced
+
+    if placed is not None:
+        return placed[0]
+    if len(nodes) < 2:
+        return None
+    gpu_node = gpu_numa_node(device)
+    return gpu_node if gpu_node in nodes else min(nodes)
+
+
+@functools.lru_cache(maxsize=1)
+def _mbind():
+    """Return a libc ``mbind`` syscall wrapper, or None on unsupported systems."""
+    import platform
+
+    nr = _SYS_MBIND.get(platform.machine())
+    if nr is None or not hasattr(os, "sched_getaffinity"):
+        return None
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+    except OSError:
+        return None
+    syscall = libc.syscall
+    syscall.restype = ctypes.c_long
+    syscall.argtypes = [
+        ctypes.c_long,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_ulong,
+        ctypes.c_uint,
+    ]
+
+    def call(addr, length, mode, mask, maxnode, flags):
+        return syscall(nr, addr, length, mode, mask, maxnode, flags)
+
+    return call
+
+
+def prefer_node(addr: int, length: int, node: int | None) -> bool:
+    """Apply ``MPOL_PREFERRED`` before ``[addr, addr + length)`` is faulted in."""
+    if node is None or length <= 0:
+        return False
+    fn = _mbind()
+    if fn is None:
+        return False
+    mask = ctypes.c_ulong(1 << node)
+    rc = fn(
+        ctypes.c_void_p(addr),
+        ctypes.c_ulong(length),
+        MPOL_PREFERRED,
+        ctypes.byref(mask),
+        ctypes.c_ulong(ctypes.sizeof(mask) * 8),
+        0,
+    )
+    if rc != 0:
+        logger.debug(
+            f"mbind(MPOL_PREFERRED, node {node}) failed: "
+            f"{os.strerror(ctypes.get_errno())}"
+        )
+        return False
+    return True
+
+
+@functools.lru_cache(maxsize=1)
+def _set_mempolicy():
+    """Return a libc ``set_mempolicy`` syscall wrapper, or None."""
+    import platform
+
+    nr = _SYS_SET_MEMPOLICY.get(platform.machine())
+    if nr is None or not hasattr(os, "sched_getaffinity"):
+        return None
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+    except OSError:
+        return None
+    syscall = libc.syscall
+    syscall.restype = ctypes.c_long
+    syscall.argtypes = [
+        ctypes.c_long,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_ulong,
+    ]
+
+    def call(mode, mask, maxnode):
+        return syscall(nr, mode, mask, maxnode)
+
+    return call
+
+
+@contextlib.contextmanager
+def allocating_on_node(node: int | None):
+    """Temporarily prefer ``node`` for allocators that fault and pin immediately."""
+    fn = None if node is None else _set_mempolicy()
+    if fn is not None:
+        mask = ctypes.c_ulong(1 << node)
+        if fn(MPOL_PREFERRED, ctypes.byref(mask), ctypes.sizeof(mask) * 8) != 0:
+            logger.debug(
+                f"set_mempolicy(node {node}): {os.strerror(ctypes.get_errno())}"
+            )
+            fn = None
+    try:
+        yield
+    finally:
+        if fn is not None:
+            fn(MPOL_DEFAULT, None, 0)
+
+
 __all__ = [
+    "allocating_on_node",
     "allowed_cpus",
+    "cpu_numa_node",
+    "device_numa_node",
+    "gpu_numa_node",
+    "moe_pool_numa_node",
     "numa_nodes",
     "placement",
+    "prefer_node",
     "rank_placement",
     "reset_placement",
     "resolve_placement",
+    "thread_siblings",
 ]
