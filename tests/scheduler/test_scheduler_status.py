@@ -35,6 +35,22 @@ def _decode_batch(n):
     return SimpleNamespace(is_prefill=False, is_decode=True, reqs=[_req(1, 0) for _ in range(n)])
 
 
+def _spec_batch(width=3, emitted=3):
+    token_block = SimpleNamespace(numel=lambda: emitted)
+    return SimpleNamespace(
+        is_prefill=True,
+        is_decode=False,
+        speculative=True,
+        reqs=[_req(1, 0)],
+        spec_emitted=[token_block],
+        spec_block=width,
+        spec_selected_width=width,
+        spec_max_width=5,
+        spec_profiled_draft_ms=24.5,
+        spec_profiled_verify_ms=148.25,
+    )
+
+
 def test_prefill_line_reports_tokens_and_throughput():
     rep, logs, clock = _reporter()
     clock["t"] = 0.5  # 30 new tokens over 0.5s -> 60 tok/s
@@ -153,6 +169,23 @@ def test_interval_is_clamped_to_at_least_one():
     assert rep.decode_log_interval == 1
     rep_neg, _, _ = _reporter(interval=-5)
     assert rep_neg.decode_log_interval == 1
+
+
+def test_spec_line_reports_profiled_width_and_cost_without_live_timing():
+    rep, logs, clock = _reporter(interval=1)
+    clock["t"] = 1.0
+    rep.report_batch(
+        _spec_batch(),
+        running_reqs=1,
+        queue_reqs=0,
+        kv_used_pages=1,
+        kv_total_pages=10,
+        page_size=1,
+    )
+    line = logs[-1]
+    assert "spec: 2/3 accepted (67%)" in line
+    assert "adaptive width: 3.0/5" in line
+    assert "profiled step: draft 24.5 ms + verify 148.2 ms" in line
 
 
 def test_usage_ratio_guard():

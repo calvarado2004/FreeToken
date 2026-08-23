@@ -77,6 +77,8 @@ def test_shared_carry_journal_rejects_prefix_overflow():
 
 class _ChooseTwo:
     block_size = 5
+    draft_cost_ms = 24.5
+    verify_cost_ms = [120.0, 136.0, 148.25, 159.0, 171.0, 184.0]
 
     def record_and_choose(self, confidence, uid):
         assert confidence.tolist() == pytest.approx([0.9] * 5)
@@ -106,6 +108,10 @@ def test_engine_compacts_only_target_views_and_keeps_full_allocation_frontier():
     engine.adapt_speculative_batch(batch)
 
     assert batch.spec_block == 2
+    assert batch.spec_selected_width == 2
+    assert batch.spec_max_width == 5
+    assert batch.spec_profiled_draft_ms == 24.5
+    assert batch.spec_profiled_verify_ms == 148.25
     assert batch.input_ids.tolist() == [0, 1, 2]
     assert batch.positions.tolist() == [9, 10, 11]
     assert batch.out_loc.tolist() == [0, 1, 2]

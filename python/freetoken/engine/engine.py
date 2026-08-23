@@ -1078,6 +1078,10 @@ class Engine:
             )
         req = batch.reqs[0]
         width = manager.record_and_choose(confidence, req.uid)
+        batch.spec_selected_width = width
+        batch.spec_max_width = manager.block_size
+        batch.spec_profiled_draft_ms = manager.draft_cost_ms
+        batch.spec_profiled_verify_ms = manager.verify_cost_ms[width]
         if width == max_width:
             return
         if not 0 <= width < max_width:

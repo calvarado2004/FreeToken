@@ -1086,13 +1086,12 @@ struct MoeTask {
 // by one worker), and x stays hot in L1 across a (token,expert)'s rows -- so the
 // kernel is single-read bandwidth-optimal at bs=1 (~205 GB/s vs ~55 GB/s PCIe).
 // One worker per *physical* core, pinned, is the sweet spot; SMT oversubscription
-// thrashes the spin-barrier. Deferred (not worth it here / for this workload):
+// thrashes the spin-barrier. Follow-up paths:
 //   - AMX-bf16: a GEMM tile engine; decode is M=1 GEMV so tiles sit idle. It would
 //     only pay off in a grouped/batched (dedup) path.
-//   - expert dedup for bs>1: read each distinct expert once and GEMM its tokens.
-//     Helps locality+bytes when bs is large; decode batches here are tiny (<=4).
-//   - NUMA: a single node is assumed. Multi-socket machines would split each
-//     expert's K dimension per node (banks are already per-row contiguous).
+// Implemented below:
+//   - expert dedup for bs>1 reads each distinct expert once across its routes.
+//   - the Python host-bank loader and worker pool prefer one GPU-local NUMA node.
 constexpr int IBLK = 32;
 constexpr int HBLK = 32;
 // Deduped pass 2 gives one work item the whole H-block for *every* token, so it owns

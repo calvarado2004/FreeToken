@@ -154,6 +154,12 @@ class Batch:
     # it from a real prefill -- these say so explicitly.
     speculative: bool = field(default=False, init=False)
     spec_block: int = field(default=0, init=False)
+    # Adaptive verification telemetry. Costs come from the paper's five-replay
+    # hardware profile, not from synchronizing every serving step.
+    spec_selected_width: int | None = field(default=None, init=False)
+    spec_max_width: int = field(default=0, init=False)
+    spec_profiled_draft_ms: float | None = field(default=None, init=False)
+    spec_profiled_verify_ms: float | None = field(default=None, init=False)
     # GraphRunner sets this only while the target verify graph is capturing/replaying.
     # It selects DSV4's fixed-shape, device-addressed verify implementation; the eager
     # prefill implementation remains the fallback when no verify graph is available.

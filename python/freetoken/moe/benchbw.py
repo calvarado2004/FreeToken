@@ -135,6 +135,11 @@ WORKLOADS: dict[str, Workload] = {
     "gpt-oss-20b": Workload("gpt-oss-20b", 2880, 2880, 32, 4, ("mxfp4_triton",),
                             activation="gpt_oss_swiglu", swiglu_limit=7.0),
     "dsv4": Workload("dsv4", 4096, 2048, 256, 6, ("ds_fp4",), swiglu_limit=7.0),
+    # Production TP4 geometry: routed experts keep E/top-k/H and shard I=2048 -> 512.
+    # Pair with ``--batch 2,3,4,5,6`` to match DSpark anchor+prefix verification.
+    "dsv4-tp4": Workload(
+        "dsv4-tp4", 4096, 512, 256, 6, ("ds_fp4",), swiglu_limit=7.0
+    ),
     "glm4.7-nvfp4": Workload("glm4.7-nvfp4", 5120, 1536, 160, 8, ("nvfp4",)),
     "minimax-m2.5": Workload("minimax-m2.5", 3072, 1536, 256, 8, ("nvfp4",)),
 }

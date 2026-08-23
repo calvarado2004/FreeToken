@@ -52,6 +52,34 @@ Constraints for DeepSeek-V4: N must divide `o_groups` (8), so N is 1, 2, 4 or 8.
 The KV pool is replicated, so its cost per GPU does not fall with N; the weights
 and the expert banks do.
 
+TP also opens a second TCP listener for rank rendezvous. It defaults to the API
+port plus one; use `--distributed-port` (alias `--rendezvous-port`) to select it
+explicitly when several servers share a host.
+
+## DeepSeek-V4 dSpark
+
+`--speculative-dspark` enables the checkpoint's block drafter and exact target
+verification. Sampling remains exact, but a speedup is not universal: draft work
+and a wider target pass are paid before the accepted prefix is known. The adaptive
+selector profiles every legal verification width and follows the paper's measured
+`D + V(k)` objective; it does not assume a fixed acceptance threshold or linear
+verification cost.
+
+The favorable regime is high prefix survival with enough experts resident or served
+by the hybrid CPU/GPU path. Structured code on a 4x RTX A4000 hybrid deployment has
+measured roughly 28--30 tok/s at 80--82% proposal acceptance, from an approximately
+18 tok/s non-dSpark baseline. Low-survival, offload-bound work can regress: open-ended
+reasoning at about 37% acceptance measured 11--14 tok/s on that deployment, and
+[independent community testing](https://github.com/FlashML-org/FreeToken/pull/69#issuecomment-5384247941)
+on 2x RTX 6000 Ada measured 35.91 tok/s with dSpark versus 39.25 tok/s without it
+at 42% acceptance.
+
+There is therefore no portable break-even acceptance number. It depends on draft
+cost, the measured width-specific verification curve, expert-cache residency, CPU
+memory bandwidth, and PCIe bandwidth. Use `ft bench decode` for alternating A/B
+measurements on representative prompts, and record acceptance and selected widths
+alongside tokens/s before enabling dSpark by default for a deployment.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into

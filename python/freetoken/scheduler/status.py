@@ -21,6 +21,12 @@ class SchedulerStatusReporter:
     # drafter from a cheap one that is always rejected.
     _spec_accepted: int = field(default=0, init=False)
     _spec_drafted: int = field(default=0, init=False)
+    _spec_steps: int = field(default=0, init=False)
+    _spec_width_total: int = field(default=0, init=False)
+    _spec_max_width: int = field(default=0, init=False)
+    _spec_profiled_steps: int = field(default=0, init=False)
+    _spec_profiled_draft_ms: float = field(default=0.0, init=False)
+    _spec_profiled_verify_ms: float = field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -119,6 +125,19 @@ class SchedulerStatusReporter:
             self._decode_generated_tokens += sum(int(e.numel()) for e in emitted)
             self._spec_accepted += sum(int(e.numel()) - 1 for e in emitted)
             self._spec_drafted += batch.spec_block * len(batch.reqs)
+            self._spec_steps += 1
+            selected = getattr(batch, "spec_selected_width", None)
+            self._spec_width_total += batch.spec_block if selected is None else int(selected)
+            self._spec_max_width = max(
+                self._spec_max_width,
+                int(getattr(batch, "spec_max_width", 0) or batch.spec_block),
+            )
+            draft_ms = getattr(batch, "spec_profiled_draft_ms", None)
+            verify_ms = getattr(batch, "spec_profiled_verify_ms", None)
+            if draft_ms is not None and verify_ms is not None:
+                self._spec_profiled_steps += 1
+                self._spec_profiled_draft_ms += float(draft_ms)
+                self._spec_profiled_verify_ms += float(verify_ms)
         else:
             self._decode_generated_tokens += len(batch.reqs)
         if self._decode_forward_count % self.decode_log_interval != 0:
@@ -129,6 +148,14 @@ class SchedulerStatusReporter:
         self._last_decode_time = now
         gen_throughput = self._decode_generated_tokens / gap if gap > 0 else 0.0
         self._decode_generated_tokens = 0
+        spec_profile = _spec_profile_msg(
+            self._spec_steps,
+            self._spec_width_total,
+            self._spec_max_width,
+            self._spec_profiled_steps,
+            self._spec_profiled_draft_ms,
+            self._spec_profiled_verify_ms,
+        )
         self.log(
             f"Decode batch, "
             f"#running-req: {running_reqs}, "
@@ -138,6 +165,7 @@ class SchedulerStatusReporter:
             f"{_mamba_msg(mamba_slots)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
             f"{_spec_msg(self._spec_accepted, self._spec_drafted)}"
+            f"{spec_profile}"
             f"#queue-req: {queue_reqs}"
         )
 
@@ -171,3 +199,24 @@ def _spec_msg(accepted: int, drafted: int) -> str:
     if drafted <= 0:
         return ""
     return f"spec: {accepted}/{drafted} accepted ({100 * accepted / drafted:.0f}%), "
+
+
+def _spec_profile_msg(
+    steps: int,
+    width_total: int,
+    max_width: int,
+    profiled_steps: int,
+    draft_ms: float,
+    verify_ms: float,
+) -> str:
+    """Paper-profiled adaptive costs, without a synchronization in the hot path."""
+    if steps <= 0:
+        return ""
+    width = width_total / steps
+    if profiled_steps <= 0:
+        return f"adaptive width: {width:.1f}/{max_width}, profiling draft, "
+    return (
+        f"adaptive width: {width:.1f}/{max_width}, profiled step: draft "
+        f"{draft_ms / profiled_steps:.1f} ms + verify "
+        f"{verify_ms / profiled_steps:.1f} ms, "
+    )
