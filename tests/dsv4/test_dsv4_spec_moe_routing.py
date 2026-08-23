@@ -9,10 +9,9 @@ from freetoken.models.deepseek_v4 import moe as dsv4_moe
 
 
 class _RoutingProbe(dsv4_moe.DSV4OffloadMoELayer):
-    """Real nn.Module construction without allocating the multi-GB expert banks."""
+    """BaseOP construction without allocating the multi-GB expert banks."""
 
     def __init__(self, cache):
-        torch.nn.Module.__init__(self)
         self.layer_id = 0
         self.top_k = 12
         self.num_experts = 64
