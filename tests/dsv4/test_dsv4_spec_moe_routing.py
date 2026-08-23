@@ -8,18 +8,19 @@ from freetoken.layers.moe import OffloadMoELayer
 from freetoken.models.deepseek_v4 import moe as dsv4_moe
 
 
+class _RoutingProbe(dsv4_moe.DSV4OffloadMoELayer):
+    """Real nn.Module construction without allocating the multi-GB expert banks."""
+
+    def __init__(self, cache):
+        torch.nn.Module.__init__(self)
+        self.layer_id = 0
+        self.top_k = 12
+        self.num_experts = 64
+        self.offload_cache = cache
+
+
 def _layer(cache):
-    layer = object.__new__(dsv4_moe.DSV4OffloadMoELayer)
-    # PyTorch 2.9 reads this inherited compatibility flag before Module.__init__ has
-    # created the instance dictionary.  Real construction reaches it through the full
-    # MoELayer initializer; this lightweight routing probe supplies it explicitly.
-    object.__setattr__(layer, "call_super_init", True)
-    torch.nn.Module.__init__(layer)
-    layer.layer_id = 0
-    layer.top_k = 12
-    layer.num_experts = 64
-    layer.offload_cache = cache
-    return layer
+    return _RoutingProbe(cache)
 
 
 def _routes(rows=6):
