@@ -58,6 +58,9 @@ DSPARK_FALLBACK_STEPS="${DSPARK_FALLBACK_STEPS:-64}"
 [ -n "${FREETOKEN_SPEC_FORCE_REJECT:-}" ] && export FREETOKEN_SPEC_FORCE_REJECT
 [ -n "${FREETOKEN_CMP_FIRST_ONLY:-}" ] && export FREETOKEN_CMP_FIRST_ONLY
 [ -n "${FREETOKEN_SPEC_WINDOW_ONLY:-}" ] && export FREETOKEN_SPEC_WINDOW_ONLY
+# FREETOKEN_DSPARK_DRAFT_GRAPH=0 is the exact-code A/B and emergency opt-out for
+# the fixed-shape drafter backbone graph. Unset captures/replays it when DSpark is on.
+[ -n "${FREETOKEN_DSPARK_DRAFT_GRAPH:-}" ] && export FREETOKEN_DSPARK_DRAFT_GRAPH
 LOG="${LOG:-/tmp/freetoken-dsv4.log}"
 # The TP ranks' torch.distributed rendezvous. Held by every rank, not just the
 # frontend, so it is the one that lingers after a stop.

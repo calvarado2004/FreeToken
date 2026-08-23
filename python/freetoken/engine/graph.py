@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import os
 import statistics
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Tuple
@@ -486,7 +487,10 @@ class GraphRunner:
             noise_token_id = int(
                 getattr(model, "speculative_draft_noise_token_id", -1)
             )
-            if draft_backbone is not None and noise_token_id >= 0:
+            draft_graph_enabled = os.environ.get(
+                "FREETOKEN_DSPARK_DRAFT_GRAPH", "1"
+            ) != "0"
+            if draft_backbone is not None and noise_token_id >= 0 and draft_graph_enabled:
                 self.draft_buffer = DraftGraphCaptureBuffer.init(
                     self.max_graph_bs,
                     self.spec_block_size,
@@ -527,6 +531,11 @@ class GraphRunner:
                         )
                     self._draft_output_map[bs] = outputs
                     self.draft_graph_map[bs] = graph
+            elif draft_backbone is not None and not draft_graph_enabled:
+                logger.info_rank0(
+                    "DSpark drafter backbone graph disabled by "
+                    "FREETOKEN_DSPARK_DRAFT_GRAPH=0"
+                )
 
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)

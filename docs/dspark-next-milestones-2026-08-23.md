@@ -110,6 +110,10 @@ Implementation gates:
 6. Long prefill, OpenWebUI-style requests, tool calls, four concurrent requests, coding,
    reasoning and repetition/coherence tests remain stable before promotion.
 
+`FREETOKEN_DSPARK_DRAFT_GRAPH=0` disables only the new drafter graph while leaving the
+rest of the exact experiment commit unchanged. Use it for the matched eager A/B and as the
+rollback path if capture headroom or graph replay fails.
+
 ## Branch and promotion discipline
 
 - Protected recovery: `milestone/dsv4-dspark-30tps` at `986823e`; do not move it.
