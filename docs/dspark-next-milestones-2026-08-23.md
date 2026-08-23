@@ -72,6 +72,12 @@ and 0.36. For each clean restart:
 6. Reject incoherence, repetition, missing final answers, OOMs, or any coding result below
    the protected baseline beyond normal run-to-run noise.
 
+Use fixed output budgets so a branch comparison is not confounded by different stopping
+points: 6,000 tokens for the pet-store coding task, 20,000 for the difficult high-reasoning
+task, and 6,000 for poem/creative-prose controls. A reasoning run that exhausts its budget
+without emitting a final answer fails the quality gate even when its hidden reasoning contains
+the right intermediate result.
+
 Promote the best repeated result, not the best single window. If the optimum is materially
 different across the two workloads, retain automatic 28% and treat a request-level split as a
 future scheduling question rather than overfitting the default.
