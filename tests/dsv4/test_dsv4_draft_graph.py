@@ -75,3 +75,6 @@ def test_markov_sampling_stays_outside_the_backbone_graph():
     backbone = inspect.getsource(DSparkDrafter.graph_backbone)
     assert "sample_block" not in backbone
     assert "draft_block" in backbone
+    # Transformer.logits is vocabulary-parallel and accepts [rows, hidden], not a
+    # request x gamma x hidden tensor (its TP all-gather flattens by row count).
+    assert "target_logits_fn(self.norm(flat_hidden))" in backbone

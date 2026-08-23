@@ -665,8 +665,9 @@ class DSparkDrafter(nn.Module):
         h = self.embed_block(input_ids).unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         for layer in self.layers:
             h = layer.draft_block(h, positions, input_ids, num_reqs, gamma, wctx)
-        head_hidden = self.hc_head(h)[0].view(num_reqs, gamma, self.dim)
-        base_logits = target_logits_fn(self.norm(head_hidden)).view(num_reqs, gamma, -1)
+        flat_hidden = self.hc_head(h)[0]
+        base_logits = target_logits_fn(self.norm(flat_hidden)).view(num_reqs, gamma, -1)
+        head_hidden = flat_hidden.view(num_reqs, gamma, self.dim)
         return base_logits, head_hidden
 
     def sample_block(
