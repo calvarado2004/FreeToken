@@ -20,7 +20,7 @@ PORT="${PORT:-8081}"
 TP_SIZE="${TP_SIZE:-4}"
 MEMORY_RATIO="${MEMORY_RATIO:-0.90}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
-MAX_PREFILL_LENGTH="${MAX_PREFILL_LENGTH:-1024}"
+MAX_PREFILL_LENGTH="${MAX_PREFILL_LENGTH:-2048}"
 EXPERT_LOAD="${EXPERT_LOAD:-serial}"
 # SPECULATIVE_DSPARK=0 turns OFF the checkpoint's dSpark drafter (the mtp.* stack).
 # On by default: the draft/verify loop is wired, and dSpark is what the checkpoint was
