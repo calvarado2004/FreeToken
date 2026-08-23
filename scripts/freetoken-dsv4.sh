@@ -22,6 +22,7 @@ MEMORY_RATIO="${MEMORY_RATIO:-0.90}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
 MAX_PREFILL_LENGTH="${MAX_PREFILL_LENGTH:-1024}"
 EXPERT_LOAD="${EXPERT_LOAD:-serial}"
+MOE_HYBRID_FETCH_FRACTION="${MOE_HYBRID_FETCH_FRACTION:-}"
 # SPECULATIVE_DSPARK=0 turns OFF the checkpoint's dSpark drafter (the mtp.* stack).
 # On by default: the draft/verify loop is wired, and dSpark is what the checkpoint was
 # trained to decode with. It costs 9.5 GiB of host expert banks and a slice of the GPU
@@ -118,6 +119,9 @@ cmd_start() {
 
     local spec=()
     [ "$SPECULATIVE_DSPARK" = "1" ] && spec=(--speculative-dspark)
+    local hybrid_fraction=()
+    [ -n "$MOE_HYBRID_FETCH_FRACTION" ] \
+        && hybrid_fraction=(--moe-hybrid-fetch-fraction "$MOE_HYBRID_FETCH_FRACTION")
 
     echo "starting DeepSeek-V4-Flash on $HOST:$PORT (TP=$TP_SIZE, memory-ratio $MEMORY_RATIO${spec:+, dSpark drafter})"
     : > "$LOG"
@@ -130,6 +134,7 @@ cmd_start() {
         --max-running-requests "$MAX_RUNNING_REQUESTS" \
         --max-prefill-length "$MAX_PREFILL_LENGTH" \
         --expert-load "$EXPERT_LOAD" \
+        "${hybrid_fraction[@]}" \
         "${spec[@]}" \
         >> "$LOG" 2>&1 < /dev/null &
     echo $! > "$PIDFILE"
