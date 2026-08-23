@@ -61,6 +61,19 @@ def _allowed_cpus() -> list[int]:
     return sorted(allowed_cpus())
 
 
+def numa_node_ids() -> set[int]:
+    """NUMA node IDs this process may run on.
+
+    Keep this separate from :func:`numa_nodes`, whose established TP-placement API
+    returns the usable CPU list for each node rather than the node identifiers.
+    """
+    return {
+        node
+        for cpu in _allowed_cpus()
+        if (node := cpu_numa_node(cpu)) is not None
+    }
+
+
 def cpu_numa_node(cpu: int) -> int | None:
     """NUMA node for one logical CPU, or None where sysfs is silent."""
     try:
@@ -241,10 +254,7 @@ def moe_pool_numa_node(device=None) -> int | None:
     if setting in ("off", "none"):
         return None
 
-    nodes = {
-        node for cpu in _allowed_cpus()
-        if (node := cpu_numa_node(cpu)) is not None
-    }
+    nodes = numa_node_ids()
     placed = placement()
     if placed is not None:
         nodes.add(placed[0])
@@ -380,6 +390,7 @@ __all__ = [
     "device_numa_node",
     "gpu_numa_node",
     "moe_pool_numa_node",
+    "numa_node_ids",
     "numa_nodes",
     "placement",
     "prefer_node",

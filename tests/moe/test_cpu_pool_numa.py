@@ -178,7 +178,7 @@ def test_prefer_node_places_a_real_mapping():
     import ctypes
     import mmap as _mmap
 
-    nodes = sorted(numa.numa_nodes())
+    nodes = sorted(numa.numa_node_ids())
     if len(nodes) < 2 or numa._mbind() is None:
         pytest.skip("needs a multi-node Linux box with mbind")
     buf = _mmap.mmap(-1, 4 << 20)
