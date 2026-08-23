@@ -36,6 +36,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.hc import hc_pre_combine
 from freetoken.kernel.triton.dsv4.norm import inv_rms
 from freetoken.utils import init_logger
@@ -639,6 +640,34 @@ class DSparkDrafter(nn.Module):
         for layer in self.layers:
             h = layer.prefill_batched(h, input_ids, segments, positions)
         return self.hc_head(h)
+
+    def graph_backbone(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        target_logits_fn,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Paper's fixed-shape parallel stage, with device-addressed attention.
+
+        Sampling is deliberately outside this first graph: FreeToken stores
+        temperature/top-p/top-k as request objects and uses live CUDA RNG. Keeping the
+        sequential Markov stage eager preserves those semantics while the expensive
+        three-layer MoE backbone and base-logit projection replay as one graph.
+        """
+        gamma = self.block_size
+        total = input_ids.numel()
+        if total < gamma or total % gamma:
+            raise ValueError(f"invalid DSpark backbone shape: {total} rows, gamma={gamma}")
+        num_reqs = total // gamma
+        rows = torch.arange(num_reqs, device=input_ids.device).repeat_interleave(gamma)
+        md = get_global_ctx().batch.attn_metadata
+        wctx = md.draft_window_ctx(positions, rows, num_reqs, gamma)
+        h = self.embed_block(input_ids).unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        for layer in self.layers:
+            h = layer.draft_block(h, positions, input_ids, num_reqs, gamma, wctx)
+        head_hidden = self.hc_head(h)[0].view(num_reqs, gamma, self.dim)
+        base_logits = target_logits_fn(self.norm(head_hidden)).view(num_reqs, gamma, -1)
+        return base_logits, head_hidden
 
     def sample_block(
         self,

@@ -1482,10 +1482,16 @@ class Engine:
             batch._spec_draft_start = torch.cuda.Event(enable_timing=True)
             batch._spec_draft_end = torch.cuda.Event(enable_timing=True)
             batch._spec_draft_start.record(self.stream)
+        sampling_params = [req.sampling_params for req in batch.reqs]
         with self.ctx.forward_batch(batch):
-            out = drafter(
-                [req.sampling_params for req in batch.reqs],
-            )
+            if self.graph_runner.can_use_draft_cuda_graph(batch):
+                base_logits, head_hidden = self.graph_runner.replay_draft(batch)
+                sample_backbone = getattr(self.model, "dspark_sample_backbone", None)
+                if sample_backbone is None:
+                    raise RuntimeError("DSpark draft graph has no sampling hook")
+                out = sample_backbone(base_logits, head_hidden, sampling_params)
+            else:
+                out = drafter(sampling_params)
         if measure_draft:
             batch._spec_draft_end.record(self.stream)
         if out is None:

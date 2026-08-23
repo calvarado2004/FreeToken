@@ -124,6 +124,49 @@ class DSV4AttnMetadata(BaseAttnMetadata):
         ).view(bs, 1, win)
         return window_slots, prev_window_slots, window_slots_topk
 
+    def draft_window_ctx(
+        self, pos: torch.Tensor, rows: torch.Tensor, num_reqs: int, span: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fixed-shape non-causal window for a DSpark draft graph.
+
+        Each query sees the trailing ``window_size`` committed context tokens followed
+        by every query in its own parallel draft block. Positions and snapshot rows
+        stay device-resident, so replay does not bake a capture-time host ``start_pos``
+        or table id into the attention indices.
+
+        Valid slots are compacted to the front in the eager path's order, with ``-1``
+        padding only at the end. This keeps early short prompts from needlessly moving
+        the valid block columns within the sparse kernel's accumulation order.
+        """
+        total = pos.numel()
+        if total != num_reqs * span or rows.numel() != total:
+            raise ValueError(
+                f"DSpark draft window has {total}/{rows.numel()} rows, expected "
+                f"{num_reqs} * {span}"
+            )
+        snap = self.full_snapshot()
+        translate = get_global_ctx().kv_cache.translate_full_to_window
+        grouped_pos = pos.view(num_reqs, span)
+        req_rows = rows.view(num_reqs, span)[:, 0]
+        start = grouped_pos[:, 0]
+        context_count = start.clamp(min=0, max=self.window_ar.numel())
+        width = self.window_ar.numel() + span
+        col = torch.arange(width, device=pos.device)[None, :]
+        is_context = col < context_count[:, None]
+        block_col = col - context_count[:, None]
+        is_block = (block_col >= 0) & (block_col < span)
+        context_pos = start[:, None] - context_count[:, None] + col
+        block_pos = grouped_pos.gather(1, block_col.clamp(min=0, max=span - 1))
+        absolute = torch.where(is_context, context_pos, block_pos).clamp_min(0)
+        full_slots = snap[req_rows[:, None], absolute]
+        slots = translate(full_slots)
+        slots = torch.where(
+            is_context | is_block, slots, torch.full_like(slots, -1)
+        )
+        topk = slots[:, None, :].expand(num_reqs, span, width).reshape(total, 1, width)
+        write_slots = translate(snap[rows, pos])
+        return write_slots, topk
+
 
 @dataclass
 class DSV4CaptureData:

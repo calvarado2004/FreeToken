@@ -500,3 +500,50 @@ class Attention(nn.Module):
         )
         apply_rotary_emb_decode(o[..., -rd:], freqs_t, True)
         return self._wo(o, n, 1).view(1, n, self.dim)
+
+    def draft_block(
+        self,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+        num_reqs: int,
+        span: int,
+        wctx,
+    ) -> torch.Tensor:
+        """Fixed-shape non-causal DSpark backbone attention for CUDA graphs.
+
+        Draft layers have no compressor/indexer. Their query block attends to the
+        trailing target context and to every position in the parallel block, matching
+        the paper and eager ``forward_ragged`` path without host-derived positions.
+        """
+        if self.compress_ratio or not self.non_causal:
+            raise RuntimeError("draft_block is only valid for non-causal DSpark layers")
+        n = x.shape[1]
+        if n != num_reqs * span:
+            raise ValueError(f"draft block has {n} rows, expected {num_reqs} * {span}")
+        rd = self.rope_head_dim
+        flat = x.reshape(n, self.dim)
+        xq = flat.unsqueeze(1)
+        freqs_t = self.freqs_cis.index_select(0, pos)
+
+        q = self.q_norm(self.wq_a(xq))
+        q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
+        q = rms_norm(q, None, self.eps)
+        apply_rotary_emb_decode(q[..., -rd:], freqs_t)
+
+        kv = self.kv_norm(self.wkv(xq))
+        apply_rotary_emb_decode(kv[..., -rd:], freqs_t)
+        act_quant_fp8_inplace(kv[..., :-rd], 64)
+
+        window_slots, window_slots_topk = wctx
+        self.attn.store_window(kv.view(n, -1), self.layer_id, window_slots)
+        o = self.attn.attend(
+            q,
+            self.layer_id,
+            window_slots_topk.int(),
+            window_slots_topk.shape[-1],
+            self.attn_sink,
+            self.softmax_scale,
+            has_compression=False,
+        )
+        apply_rotary_emb_decode(o[..., -rd:], freqs_t, True)
+        return self._wo(o, n, 1).view(1, n, self.dim)

@@ -136,6 +136,61 @@ class SpecGraphCaptureBuffer:
         self.request_table_idx[:reqs].copy_(batch.active_table_idx)
 
 
+@dataclass
+class DraftGraphCaptureBuffer:
+    """Persistent compact ``anchor + gamma-1 noise`` drafter inputs."""
+
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    request_table_idx: torch.Tensor
+    gamma: int
+    noise_token_id: int
+
+    @classmethod
+    def init(
+        cls,
+        max_reqs: int,
+        gamma: int,
+        noise_token_id: int,
+        device: torch.device,
+    ) -> "DraftGraphCaptureBuffer":
+        return cls(
+            input_ids=torch.full(
+                (max_reqs * gamma,), noise_token_id, dtype=torch.int32, device=device
+            ),
+            positions=torch.zeros(max_reqs * gamma, dtype=torch.int32, device=device),
+            request_table_idx=torch.zeros(max_reqs, dtype=torch.int64, device=device),
+            gamma=gamma,
+            noise_token_id=noise_token_id,
+        )
+
+    def set_batch(self, batch: Batch) -> None:
+        reqs = batch.padded_size
+        tokens = reqs * self.gamma
+        batch.input_ids = self.input_ids[:tokens]
+        batch.positions = self.positions[:tokens]
+        batch.active_table_idx = self.request_table_idx[:reqs]
+
+    def copy_from(self, batch: Batch) -> None:
+        reqs = batch.padded_size
+        target_span = int(batch.spec_block) + 1
+        if int(batch.spec_block) != self.gamma:
+            raise RuntimeError(
+                f"DSpark draft graph captured gamma={self.gamma}, got {batch.spec_block}"
+            )
+        target_ids = batch.input_ids.view(reqs, target_span)
+        target_pos = batch.positions.view(reqs, target_span)
+        ids = self.input_ids[: reqs * self.gamma].view(reqs, self.gamma)
+        ids.fill_(self.noise_token_id)
+        ids[:, 0].copy_(target_ids[:, 0])
+        self.positions[: reqs * self.gamma].view(reqs, self.gamma).copy_(
+            target_pos[:, : self.gamma]
+        )
+        if batch.active_table_idx is None or batch.active_table_idx.numel() != reqs:
+            raise RuntimeError("DSpark draft graph needs one active table row per request")
+        self.request_table_idx[:reqs].copy_(batch.active_table_idx)
+
+
 class SharedSpecCarryJournal:
     """Maximum-span carry outputs shared by every adaptive verify graph.
 
@@ -235,6 +290,7 @@ class GraphRunner:
         self._dspark_feature_map: Dict[int, object] = {}
         self._spec_feature_map: Dict[Tuple[int, int], object] = {}
         self._spec_carry_map: Dict[Tuple[int, int], dict] = {}
+        self._draft_output_map: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         # Measured (span, milliseconds) curve for the paper's hardware-aware
         # verification scheduler.  It is populated only for the single-request
         # graphs that FreeToken's current DSV4 serving mode can compact safely.
@@ -277,6 +333,7 @@ class GraphRunner:
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
         self.spec_graph_map: Dict[Tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self.draft_graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
@@ -421,6 +478,56 @@ class GraphRunner:
                     ", ".join(f"{span} rows={cost:.2f}ms" for span, cost in monotonic),
                 )
 
+            # vLLM captures the full DSpark step. FreeToken's request sampling controls
+            # are still Python objects, so this first graph deliberately stops at the
+            # fixed parallel backbone + base logits. The sequential Markov sampler stays
+            # eager, preserving live temperature/top-p/top-k and CUDA RNG semantics.
+            draft_backbone = getattr(model, "dspark_draft_backbone", None)
+            noise_token_id = int(
+                getattr(model, "speculative_draft_noise_token_id", -1)
+            )
+            if draft_backbone is not None and noise_token_id >= 0:
+                self.draft_buffer = DraftGraphCaptureBuffer.init(
+                    self.max_graph_bs,
+                    self.spec_block_size,
+                    noise_token_id,
+                    self.device,
+                )
+                logger.info_rank0(
+                    "Capturing DSpark drafter backbone graphs: requests=%s, rows/request=%d",
+                    self.graph_bs_list,
+                    self.spec_block_size,
+                )
+                for bs in sorted(self.graph_bs_list, reverse=True):
+                    graph = torch.cuda.CUDAGraph()
+                    batch = Batch(reqs=[self.dummy_req] * bs, phase="prefill")
+                    batch.padded_reqs = batch.reqs
+                    batch.speculative = True
+                    batch.spec_block = self.spec_block_size
+                    self.draft_buffer.set_batch(batch)
+                    tokens = bs * self.spec_block_size
+                    self.draft_buffer.input_ids[:tokens].fill_(noise_token_id)
+                    self.draft_buffer.positions[:tokens].copy_(
+                        torch.arange(
+                            self.spec_block_size, device=self.device, dtype=torch.int32
+                        ).repeat(bs)
+                    )
+                    self.draft_buffer.request_table_idx[:bs].fill_(
+                        self.dummy_req.table_idx
+                    )
+                    spec_capture(batch)
+                    with get_global_ctx().forward_batch(batch):
+                        draft_backbone()
+                        with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                            outputs = draft_backbone()
+                        self._reset_moe_offload_cache()
+                    if outputs is None:
+                        raise RuntimeError(
+                            "DSpark drafter backbone capture returned no outputs"
+                        )
+                    self._draft_output_map[bs] = outputs
+                    self.draft_graph_map[bs] = graph
+
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
@@ -435,6 +542,21 @@ class GraphRunner:
             and key in self.spec_graph_map
             and batch.padded_size == batch.size
         )
+
+    def can_use_draft_cuda_graph(self, batch: Batch) -> bool:
+        return bool(
+            batch.speculative
+            and int(batch.spec_block) == self.spec_block_size
+            and batch.padded_size == batch.size
+            and batch.padded_size in self.draft_graph_map
+        )
+
+    def replay_draft(self, batch: Batch) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert self.can_use_draft_cuda_graph(batch)
+        self.draft_buffer.copy_from(batch)
+        self.attn_backend.prepare_for_spec_replay(batch)
+        self.draft_graph_map[batch.padded_size].replay()
+        return self._draft_output_map[batch.padded_size]
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
@@ -488,10 +610,13 @@ class GraphRunner:
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
         self.spec_graph_map = {}
+        self.draft_graph_map = {}
         self._dspark_feature_map = {}
         self._spec_feature_map = {}
         self._spec_carry_map = {}
+        self._draft_output_map = {}
         self.spec_verify_cost_curve = []
         self.buffer = None
         self.spec_buffer = None
+        self.draft_buffer = None
         gc.collect()

@@ -176,6 +176,24 @@ class Block(nn.Module):
         x = self.ffn(x, input_ids)
         return self.hc_post(x, residual, post, comb)
 
+    def draft_block(self, x, pos, input_ids, num_reqs, span, wctx):
+        """Fixed-shape DSpark block; identical algebra to ``prefill_batched``."""
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        )
+        x = self.attn_norm(x)
+        x = self.attn.draft_block(x, pos, num_reqs, span, wctx)
+        x = self.hc_post(x, residual, post, comb)
+
+        residual = x
+        x, post, comb = self.hc_pre(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        )
+        x = self.ffn_norm(x)
+        x = self.ffn(x, input_ids)
+        return self.hc_post(x, residual, post, comb)
+
 
 class Transformer(nn.Module):
     def __init__(self, args: DeepseekV4Args):
@@ -445,6 +463,9 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         self.speculative_verify_block_size = (
             self._args.dspark_block_size if self._args.n_draft_layers else 0
         )
+        self.speculative_draft_noise_token_id = (
+            self._args.dspark_noise_token_id if self._args.n_draft_layers else -1
+        )
 
     def _ensure_bound(self) -> None:
         if self._bound:
@@ -549,6 +570,35 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             self._transformer.logits,
             sampling_params,
         )
+
+    def dspark_draft_backbone(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Fixed-shape parallel-backbone hook captured by :class:`GraphRunner`."""
+        drafter = self._transformer.drafter
+        if drafter is None:
+            return None
+        self._ensure_bound()
+        batch = get_global_ctx().batch
+        return drafter.graph_backbone(
+            batch.input_ids.long().view(1, -1),
+            batch.positions.long(),
+            self._transformer.logits,
+        )
+
+    def dspark_sample_backbone(
+        self,
+        base_logits: torch.Tensor,
+        head_hidden: torch.Tensor,
+        sampling_params,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the dynamic/RNG-sensitive Markov stage after a backbone replay."""
+        drafter = self._transformer.drafter
+        if drafter is None:
+            raise RuntimeError("DSpark backbone replay has no loaded drafter")
+        batch = get_global_ctx().batch
+        gamma = int(batch.spec_block)
+        span = gamma + 1
+        anchors = batch.input_ids.view(len(batch.reqs), span)[:, 0].long()
+        return drafter.sample_block(base_logits, head_hidden, anchors, sampling_params)
 
     def forward(self) -> torch.Tensor:
         self._ensure_bound()
