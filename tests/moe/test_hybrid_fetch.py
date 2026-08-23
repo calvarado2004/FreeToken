@@ -18,10 +18,12 @@ Q = 1 << 16
 
 def _balanced_fetch(num_missing: int, frac_q16: int) -> int:
     """Reference split: F ~ frac * misses, rounded to whichever integer neighbor
-    minimizes the slower overlapped side (fetch ~ F*(1-frac), CPU ~ (M-F)*frac)."""
+    minimizes the slower overlapped side (fetch ~ F*(1-frac), CPU ~ (M-F)*frac),
+    with the paper's one-fill cache-warming floor when any miss exists."""
     lo = (num_missing * frac_q16) >> 16
     cost = lambda f: max(f * (Q - frac_q16), (num_missing - f) * frac_q16)  # noqa: E731
-    return min(num_missing, lo if cost(lo) <= cost(lo + 1) else lo + 1)
+    rounded = lo if cost(lo) <= cost(lo + 1) else lo + 1
+    return min(num_missing, max(1, rounded))
 
 
 def test_balanced_fetch_tracks_fraction():
@@ -37,6 +39,16 @@ def test_balanced_fetch_tracks_fraction():
     # 1.24 -> fetching 2 makes the PCIe side ~1.6x slower than balance; keep it at 1.
     assert _balanced_fetch(3, round(0.415 * Q)) == 1
     assert _balanced_fetch(4, round(0.415 * Q)) == 2
+
+
+def test_balanced_fetch_keeps_the_paper_cache_warming_floor():
+    # FreeToken §3.2: "It always retains at least one fill, so the cache continues
+    # warming even when the CPU handles most misses."  The Lenovo's profiled 28% split
+    # otherwise rounds m=1 to zero and can strand a locally recurring expert on CPU.
+    q = round(0.28 * Q)
+    assert _balanced_fetch(0, q) == 0
+    assert _balanced_fetch(1, q) == 1
+    assert _balanced_fetch(2, q) == 1
 
 
 def test_load_hybrid_fetch_fraction(tmp_path):

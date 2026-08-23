@@ -165,7 +165,11 @@ def _ensure_experts_hybrid_cpu(
         m, q = len(missing), 1 << 16
         lo = (m * frac_q16) >> 16
         cost = lambda f: max(f * (q - frac_q16), (m - f) * frac_q16)  # noqa: E731
-        max_fetch = lo if cost(lo) <= cost(lo + 1) else lo + 1
+        # FreeToken §3.2 keeps at least one fill whenever a miss exists so the LRU
+        # cache continues warming.  Without this floor, a profiled fraction below 0.5
+        # rounds a lone miss to zero; a temporally-local expert can then execute on the
+        # CPU forever instead of becoming a hit on the following tokens.
+        max_fetch = max(1, lo if cost(lo) <= cost(lo + 1) else lo + 1)
     num_fetch = min(len(missing), int(max_fetch))
     cache.num_missing_full.fill_(len(missing))
     cache.num_indices.fill_(num_fetch)
@@ -359,7 +363,10 @@ def _ensure_experts_hybrid_kernel(
         cost_hi = tl.maximum(
             (lo + 1) * ((1 << 16) - fetch_frac_q16), (num_missing - lo - 1) * fetch_frac_q16
         )
-        max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
+        # FreeToken §3.2 explicitly retains at least one fill so the cache keeps
+        # warming.  num_fetch is still clamped by num_missing below, hence zero misses
+        # correctly issue zero copies.
+        max_fetch = tl.maximum(1, tl.where(cost_lo <= cost_hi, lo, lo + 1))
     num_fetch = tl.minimum(num_missing, max_fetch)
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))
