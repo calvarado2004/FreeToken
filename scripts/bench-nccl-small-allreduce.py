@@ -103,6 +103,14 @@ def main() -> None:
                 flush=True,
             )
 
+        # NCCL graph registrations belong to the process group.  Releasing the
+        # graph before destroying that group avoids a shutdown wait on live
+        # capture resources after all measurements have already completed.
+        graph.reset()
+        del graph
+        torch.cuda.synchronize()
+
+    dist.barrier()
     dist.destroy_process_group()
 
 
