@@ -18,7 +18,10 @@ MODEL="${MODEL:-$HOME/models/DeepSeek-V4-Flash-0731}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8081}"
 TP_SIZE="${TP_SIZE:-4}"
-MEMORY_RATIO="${MEMORY_RATIO:-0.90}"
+# Six DSpark verify graphs plus long-prompt Triton work need real headroom on the
+# 16-GiB A4000s. 0.90 has repeatedly left only ~1 GiB before capture (and as
+# little as 0.07 GiB afterward); 0.87 is the measured stable deployment point.
+MEMORY_RATIO="${MEMORY_RATIO:-0.87}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
 MAX_PREFILL_LENGTH="${MAX_PREFILL_LENGTH:-1024}"
 EXPERT_LOAD="${EXPERT_LOAD:-serial}"
@@ -150,7 +153,10 @@ cmd_start() {
             echo; echo "startup FAILED -- last lines:" >&2
             grep -aE "Error|OutOfMemory|assert" "$LOG" | tail -3 >&2
             echo "hint: an OOM during CUDA-graph capture means MEMORY_RATIO is too high." >&2
-            cmd_stop >/dev/null 2>&1
+            # This script is the development/test harness. A failed rank can ignore
+            # SIGTERM while holding every GPU and its pinned expert bank, so recover
+            # immediately with the targeted kill + /dev/shm cleanup path.
+            cmd_kill >/dev/null 2>&1
             return 1
         fi
         sleep 10; waited=$((waited + 10))
