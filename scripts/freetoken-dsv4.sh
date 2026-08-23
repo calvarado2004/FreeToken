@@ -9,7 +9,7 @@
 #   ./freetoken-dsv4.sh test      send one request
 #
 # Override any setting from the environment, e.g.
-#   MEMORY_RATIO=0.88 ./freetoken-dsv4.sh start
+#   MEMORY_RATIO=0.86 ./freetoken-dsv4.sh start
 
 set -uo pipefail
 
@@ -128,6 +128,7 @@ cmd_start() {
     setsid "$FT" serve \
         --model "$MODEL" \
         --host "$HOST" --port "$PORT" \
+        --distributed-port "$RDZV_PORT" \
         --tensor-parallel-size "$TP_SIZE" \
         --memory-ratio "$MEMORY_RATIO" \
         --max-running-requests "$MAX_RUNNING_REQUESTS" \

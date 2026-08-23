@@ -15,6 +15,7 @@ from freetoken.utils import init_logger
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
+    distributed_port: int | None = None
     num_tokenizer: int = 0
     silent_output: bool = False
     # The terminal shell is attached to this server (ft shell --model / ft serve --shell-mode).
@@ -70,7 +71,8 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def distributed_addr(self) -> str:
-        return f"tcp://127.0.0.1:{self.server_port + 1}"
+        port = self.distributed_port
+        return f"tcp://127.0.0.1:{port if port is not None else self.server_port + 1}"
 
 
 def parse_args(
@@ -308,6 +310,17 @@ def parse_args(
         dest="server_port",
         default=ServerArgs.server_port,
         help="The port number for the server to listen on.",
+    )
+
+    parser.add_argument(
+        "--distributed-port",
+        "--rendezvous-port",
+        type=int,
+        default=ServerArgs.distributed_port,
+        help=(
+            "TCP port used by tensor-parallel rank rendezvous. Defaults to --port + 1; "
+            "set it explicitly when running multiple instances on one host."
+        ),
     )
 
     parser.add_argument(

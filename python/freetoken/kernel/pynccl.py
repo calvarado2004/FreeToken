@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ctypes.util
 import functools
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from freetoken.env import ENV
@@ -23,9 +26,73 @@ else:
     PyNCCLCommunicator = Any
 
 
+def _nccl_search_dirs() -> list[Path]:
+    """Candidate NCCL library directories, explicit override first."""
+    dirs: list[Path] = []
+    override = os.getenv("FREETOKEN_NCCL_LIB_DIR", "").strip()
+    if override:
+        dirs.append(Path(override))
+
+    try:
+        import torch
+
+        torch_root = Path(torch.__file__).resolve().parent
+        dirs.extend([torch_root / "lib", torch_root.parent / "nvidia" / "nccl" / "lib"])
+    except (ImportError, OSError):
+        pass
+
+    dirs.extend(
+        Path(path)
+        for path in (
+            "/usr/lib64",
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/local/cuda/lib64",
+        )
+    )
+    # Preserve priority while avoiding duplicate linker/rpath entries.
+    return list(dict.fromkeys(dirs))
+
+
+def _nccl_link_flags() -> list[str]:
+    """Resolve NCCL before launching TP ranks, including wheel-bundled runtimes.
+
+    ``-lnccl`` requires the unversioned development symlink. PyTorch wheels may ship
+    only ``libnccl.so.2``; passing that file directly supports the runtime-only case
+    and gives the built extension a matching rpath.
+    """
+    checked: list[str] = []
+    for directory in _nccl_search_dirs():
+        checked.append(str(directory))
+        unversioned = directory / "libnccl.so"
+        if unversioned.is_file():
+            return [f"-L{directory}", f"-Wl,-rpath,{directory}", "-lnccl"]
+        versioned = sorted(directory.glob("libnccl.so.*"), reverse=True)
+        if versioned:
+            return [str(versioned[0]), f"-Wl,-rpath,{directory}"]
+
+    soname = ctypes.util.find_library("nccl")
+    if soname:
+        if os.path.isabs(soname):
+            directory = Path(soname).parent
+            return [soname, f"-Wl,-rpath,{directory}"]
+        # GNU ld accepts an exact soname after ``-l:`` even when the development
+        # package did not provide the unversioned ``libnccl.so`` symlink.
+        return [f"-l:{soname}"]
+
+    locations = ", ".join(checked)
+    raise RuntimeError(
+        "PyNCCL tensor parallelism requires an NCCL library, but none was found. "
+        "Install libnccl2 plus libnccl-dev (or the distribution equivalents), "
+        "or set FREETOKEN_NCCL_LIB_DIR to a directory containing libnccl.so[.N]. "
+        f"Checked: {locations}"
+    )
+
+
 @functools.cache
 def _load_nccl_module() -> Module:
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    return load_aot(
+        "pynccl", cuda_files=["pynccl.cu"], extra_ldflags=_nccl_link_flags()
+    )
 
 
 @functools.cache

@@ -5,10 +5,12 @@
 - Linux x86_64, NVIDIA GPU, driver r580+ (CUDA 13)
 - Python >= 3.10, with [uv](https://docs.astral.sh/uv/) recommended (plain
   `pip` + `venv` works too)
-- Multi-GPU (`--tensor-parallel-size > 1`): NCCL development libraries for
-  the JIT link step, e.g. `sudo apt-get install libnccl2 libnccl-dev`.
-  Without them the first TP launch fails at link time with
-  `/usr/bin/ld: cannot find -lnccl`.
+- Multi-GPU (`--tensor-parallel-size > 1`): an NCCL runtime library. Installing
+  the development package is recommended, e.g. `sudo apt-get install libnccl2
+  libnccl-dev`. FreeToken also discovers a versioned NCCL runtime bundled with
+  PyTorch when no unversioned development link exists. Set
+  `FREETOKEN_NCCL_LIB_DIR` for a nonstandard installation; if discovery fails,
+  startup reports the searched locations before launching TP ranks.
 
 ## Method 1: Install from PyPI
 
