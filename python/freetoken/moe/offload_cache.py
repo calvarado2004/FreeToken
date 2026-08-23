@@ -573,6 +573,13 @@ class OffloadMoeCache:
             # fence the first prefetch would stomp bytes a running GEMM is reading.
             self.prefill_begin_event.record(torch.cuda.current_stream(self.device))
             self.prefill_copy_stream.wait_event(self.prefill_begin_event)
+        # The begin fence above supersedes release events from the preceding eager
+        # warm-up/prefill: every old buffer is now ordered behind the whole compute
+        # stream.  Keeping these flags set makes a CUDA-graph capture additionally wait
+        # on the old, uncaptured release events and fails with
+        # cudaErrorStreamCaptureIsolation.  Releases recorded later in THIS prefill set
+        # the flags again, preserving the buffer-reuse dependency within the capture.
+        self._prefill_buffer_has_release_event = [False, False]
         self._prefill_hit_d2d_active = self.prefill_hit_d2d and self._hit_d2d_usable()
         if self._prefill_hit_d2d_active:
             # The copy stream is fenced behind the previous decode, so the snapshot

@@ -116,16 +116,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
     ) -> torch.Tensor:
         cache = self.offload_cache
         assert cache is not None
-        # A speculative verify is a decode wearing a prefill's clothes.  Decide that
-        # BEFORE the prompt-density crossover below: at the widest captured DSpark
-        # span, T*top_k can cover the expert set and used to enter whole-layer prefill
-        # streaming.  Capturing that path either depended on uncaptured copy-stream
-        # events (prefill overlap on) or materialized every expert into the graph and
-        # exhausted its private pool (overlap off).  Verification must stay on the
-        # on-demand/decode path at every legal span.
         is_speculative = bool(getattr(get_global_ctx().batch, "speculative", False))
-        if is_speculative and cache.decode_target == "hybrid":
-            return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
         # Whole-layer streaming moves all num_experts rows per layer; a small
         # chunk touches at most T*top_k of them, so below that crossover the
@@ -133,8 +124,19 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         # keeps short-prompt slot residency -- hence hybrid decode's GPU/CPU
         # route split -- unchanged). Mixing modes across chunks is safe: the
         # streaming buffers disown their borrowed slots on invalidation.
-        if not is_speculative and hidden_states.shape[0] * self.top_k >= self.num_experts:
+        # A wide DSpark verify may also cross this threshold.  Keep the fast whole-layer
+        # path when overlap is enabled (begin_prefill makes its side stream capture-safe),
+        # but never capture synchronous whole-layer materialization when overlap was
+        # explicitly disabled -- that is the Ada OOM fallback Gabriel Devenyi reported.
+        dense_routes = hidden_states.shape[0] * self.top_k >= self.num_experts
+        if dense_routes and (not is_speculative or cache.prefill_overlap):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
+
+        # A speculative verify is a decode wearing a prefill's clothes.  Below the
+        # whole-layer crossover, hybrid decode caps PCIe fills and overlaps the rest on
+        # CPU.  With overlap disabled this also becomes the safe path for wide verifies.
+        if is_speculative and cache.decode_target == "hybrid":
+            return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
         # The path below fetches EVERY missing expert over PCIe, uncapped, with no CPU
         # overlap. That is the right trade for a prompt, where the fetch amortizes over
@@ -143,8 +145,8 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         # single-token step, which is the whole reason speculation lost to plain decode
         # here rather than a low acceptance rate.
         #
-        # Hybrid verification returned above; a non-hybrid verification deliberately
-        # remains on this on-demand slot path rather than whole-layer prefill movement.
+        # A non-hybrid verify remains on this on-demand slot path whenever whole-layer
+        # overlap is unavailable.
         cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
         cache.copy_missing()
         if cache.collect_stats:

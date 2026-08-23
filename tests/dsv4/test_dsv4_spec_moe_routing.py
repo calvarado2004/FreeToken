@@ -30,10 +30,24 @@ def _routes(rows=6):
     )
 
 
-def test_wide_hybrid_verify_uses_decode_before_prompt_crossover(monkeypatch):
-    cache = SimpleNamespace(decode_target="hybrid")
+def test_wide_hybrid_verify_keeps_fast_overlap_crossover(monkeypatch):
+    cache = SimpleNamespace(decode_target="hybrid", prefill_overlap=True)
     layer = _layer(cache)
     expected = torch.tensor([17.0])
+    monkeypatch.setattr(
+        dsv4_moe,
+        "get_global_ctx",
+        lambda: SimpleNamespace(batch=SimpleNamespace(speculative=True)),
+    )
+    monkeypatch.setattr(OffloadMoELayer, "_prefill_routed", lambda *_: expected)
+
+    assert layer._prefill_routed(*_routes()) is expected
+
+
+def test_wide_hybrid_verify_uses_decode_when_overlap_is_disabled(monkeypatch):
+    cache = SimpleNamespace(decode_target="hybrid", prefill_overlap=False)
+    layer = _layer(cache)
+    expected = torch.tensor([19.0])
     layer._decode_routed = lambda *_: expected
     monkeypatch.setattr(
         dsv4_moe,
@@ -43,17 +57,18 @@ def test_wide_hybrid_verify_uses_decode_before_prompt_crossover(monkeypatch):
     monkeypatch.setattr(
         OffloadMoELayer,
         "_prefill_routed",
-        lambda *_: (_ for _ in ()).throw(AssertionError("entered prefill overlap")),
+        lambda *_: (_ for _ in ()).throw(AssertionError("materialized whole layer")),
     )
 
     assert layer._prefill_routed(*_routes()) is expected
 
 
-def test_wide_offload_verify_uses_on_demand_slots(monkeypatch):
+def test_wide_offload_verify_uses_on_demand_slots_without_overlap(monkeypatch):
     calls = []
 
     class Cache:
         decode_target = "offload"
+        prefill_overlap = False
         collect_stats = False
 
         def ensure_experts(self, layer_id, ids):
@@ -87,7 +102,7 @@ def test_wide_offload_verify_uses_on_demand_slots(monkeypatch):
 
 
 def test_wide_prompt_still_uses_prefill_overlap_crossover(monkeypatch):
-    layer = _layer(SimpleNamespace(decode_target="offload"))
+    layer = _layer(SimpleNamespace(decode_target="offload", prefill_overlap=True))
     expected = torch.tensor([31.0])
     monkeypatch.setattr(
         dsv4_moe,

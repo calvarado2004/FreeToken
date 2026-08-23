@@ -16,6 +16,18 @@ from freetoken.moe.offload_cache import OffloadMoeCache
 Q = 1 << 16
 
 
+def test_new_prefill_fence_supersedes_old_release_events():
+    cache = object.__new__(OffloadMoeCache)
+    cache.prefill_overlap = True
+    cache.prefill_copy_stream = None
+    cache.prefill_hit_d2d = False
+    cache._prefill_buffer_has_release_event = [True, True]
+
+    cache.begin_prefill()
+
+    assert cache._prefill_buffer_has_release_event == [False, False]
+
+
 def _balanced_fetch(num_missing: int, frac_q16: int) -> int:
     """Reference split: F ~ frac * misses, rounded to whichever integer neighbor
     minimizes the slower overlapped side (fetch ~ F*(1-frac), CPU ~ (M-F)*frac)."""
