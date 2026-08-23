@@ -18,7 +18,10 @@ MODEL="${MODEL:-$HOME/models/DeepSeek-V4-Flash-0731}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8081}"
 TP_SIZE="${TP_SIZE:-4}"
-MEMORY_RATIO="${MEMORY_RATIO:-0.90}"
+# 0.80 leaves the measured 1.26 GiB headroom after DSpark graph capture on this
+# workstation. At 0.90 a fully free restart can auto-size 2509 MoE slots (instead of
+# the proven 2016) and leave only 1.02 GiB, which OOMs during verify-graph capture.
+MEMORY_RATIO="${MEMORY_RATIO:-0.80}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
 MAX_PREFILL_LENGTH="${MAX_PREFILL_LENGTH:-2048}"
 EXPERT_LOAD="${EXPERT_LOAD:-serial}"

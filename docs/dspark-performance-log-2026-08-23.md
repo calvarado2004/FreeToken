@@ -24,7 +24,8 @@ forbidden.
 | `milestone/dsv4-dspark-30tps` | `986823e` | Protected recovery point; do not advance casually. |
 | `prod/dsv4-dspark-enhanced-v2` | `2ce0070` | Confirmed pre-graph-fix enhanced baseline. |
 | `prod/dsv4-dspark-enhanced-v3` | `000b41f` | Graph-capture fixes plus 2048-token prefill default. |
-| `experiment/dsv4-v2-prefill2048` | `f1e5c3f` | Enhanced-v2 plus only the 2048-token prefill default; current combined candidate. |
+| `experiment/dsv4-v2-prefill2048` | `606b7cf` | Enhanced-v2 plus the 2048-token prefill default and this measurement log. |
+| `experiment/dspark-acceptance-fallback` | `7a93e04` | Opt-in measured-acceptance circuit breaker under A/B test. |
 | `experiment/dsv4-prefill-profile` | `91a748f` | Opt-in bounded one-shot prefill profiler; pushed but not deployed. |
 
 ## Confirmed prefill gain
@@ -116,11 +117,58 @@ The first prefill or decode throughput line after an idle interval is also not a
 measurement because the status reporter includes time since the previous report. Use consecutive
 full-chunk or decode windows instead.
 
+## Measured-acceptance fallback experiment
+
+Commit `7a93e04` adds an opt-in, request-local circuit breaker. It does not classify the prompt.
+After 32 actual DSpark proposals, a measured acceptance rate below 60% selects ordinary target
+decode for exactly 64 steps and then probes DSpark again. The ordinary path already commits each
+new target hidden feature into the drafter's context KV, so a later probe resumes from current
+state. The fallback is disabled by default and passed 202 DSpark/hybrid-fetch tests on the exact
+pushed Lenovo worktree.
+
+The standard 600-token pet-store landing-page control did not trip the circuit breaker. It
+completed in 21.11 seconds, with steady windows of **30.55 and 27.33 tok/s**, and produced coherent
+HTML/CSS until the requested length cutoff. A 256-token warm-up accepted 137/163 proposals (84%);
+its final 32-proposal tail happened to fall to 56.2% and tripped only as the request completed.
+That late event had no effect on the completed output, but it shows that 32 proposals remains an
+experimental, somewhat reactive observation window.
+
+The identical temperature-1.0 request `tell me a story about horses and humans` is the intended
+low-acceptance control:
+
+| Run | Completion | Wall time | End-to-end completion rate |
+| --- | ---: | ---: | ---: |
+| No circuit breaker (`606b7cf`, inferred from server timestamps) | about 1,536 tokens | about 98 s | about 15.7 tok/s |
+| Acceptance fallback (`7a93e04`) | 1,513 tokens | 88.07 s | 17.18 tok/s |
+
+The fallback run repeatedly measured 30.3%-59.4% local acceptance. Its target-only windows reached
+**17.86-19.59 tok/s**, while mixed probe windows could still fall to about 15-17 tok/s. The response
+stopped naturally, was coherent end to end, and contained no token repetition. This is roughly a
+10% wall-time reduction on one matched creative-prose run; it is promising evidence, not yet a
+universal claim.
+
+Bounded bridge-and-torch logic controls found the correct 17-minute strategy immediately and did
+not repeat tokens. However, both `reasoning_effort=high` and `low` consumed 1,200 completion tokens
+trying to formalize the optimality proof and reached the length limit without opening the final
+answer channel. This resembles the earlier 1,200-token 25-horses truncation and is not introduced
+by the fallback, but it remains a quality/serving caveat: reasoning-mode output budgets or
+termination behavior need a separate fix before production promotion.
+
+### Capture-budget finding
+
+A clean restart at `--memory-ratio 0.90` auto-sized 2,509 MoE cache slots, versus the previously
+successful 2,016, and left only 1.02 GiB before graph capture. DSpark verify capture OOMed. At
+`0.80`, auto-sizing returned to 2,016 slots, left 2.56 GiB before capture and 1.26 GiB afterward,
+and the server started normally. The Lenovo profile therefore now defaults to 0.80. This is a
+separate auto-cache/capture-budget interaction; the acceptance controller itself allocates no GPU
+tensors.
+
 ## Current conclusion and promotion gate
 
-`f1e5c3f` is the best combined candidate measured so far: it retains approximately 30 tok/s on the
-standard coding control and improves the fixed reasoning control while carrying the 2048 prefill
-default. It is not yet a production declaration.
+`606b7cf` remains the best fallback-disabled combined candidate: it retains approximately 30 tok/s
+on the standard coding control and improves the fixed reasoning control while carrying the 2048
+prefill default. `7a93e04` adds a promising opt-in low-acceptance speedup without regressing the
+coding control, but it is not yet a production declaration.
 
 Before promotion:
 
@@ -131,4 +179,7 @@ Before promotion:
 4. Test `5ba7abc` and `95e3233` separately to locate the reasoning regression while retaining the
    Ada graph-capture compatibility work.
 5. Do not move the protected recovery branch during this experiment.
-
+6. Replicate the matched creative-prose A/B and tune the acceptance window/cooldown before enabling
+   the circuit breaker by default.
+7. Add a reasoning-mode termination/budget test that requires a final answer, not merely a correct
+   hidden chain.
