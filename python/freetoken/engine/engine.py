@@ -313,6 +313,14 @@ _SPEC_TIMING = os.environ.get("FREETOKEN_SPEC_TIMING", "0") == "1"
 # One-shot operator profile of the target verify. Explicit opt-in: Kineto adds
 # substantial CPU overhead and synchronizes CUDA when the table is emitted.
 _SPEC_PROFILE = os.environ.get("FREETOKEN_SPEC_PROFILE", "0") == "1"
+# One-shot operator profile of the first sufficiently large, non-speculative prefill.
+# Shape recording stays off for this path because a 2k-token, 46-layer trace otherwise
+# retains substantial metadata and can turn a diagnostic into the OOM it is investigating.
+_PREFILL_PROFILE = os.environ.get("FREETOKEN_PREFILL_PROFILE", "0") == "1"
+_PREFILL_PROFILE_MIN_TOKENS = max(
+    1, int(os.environ.get("FREETOKEN_PREFILL_PROFILE_MIN_TOKENS", "1024"))
+)
+
 
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
@@ -485,6 +493,7 @@ class Engine:
         self._spec_drafted = 0
         self._spec_timing_left = 12
         self._spec_profile_left = 1
+        self._prefill_profile_left = 1
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -1470,9 +1479,17 @@ class Engine:
         timing = bool(
             batch.speculative and _SPEC_TIMING and self._spec_timing_left > 0
         )
-        profiling = bool(
+        spec_profiling = bool(
             batch.speculative and _SPEC_PROFILE and self._spec_profile_left > 0
         )
+        prefill_profiling = bool(
+            batch.is_prefill
+            and not batch.speculative
+            and _PREFILL_PROFILE
+            and self._prefill_profile_left > 0
+            and batch.input_ids.numel() >= _PREFILL_PROFILE_MIN_TOKENS
+        )
+        profiling = spec_profiling or prefill_profiling
         if timing:
             target_start = torch.cuda.Event(enable_timing=True)
             target_end = torch.cuda.Event(enable_timing=True)
@@ -1483,7 +1500,7 @@ class Engine:
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=True,
+                record_shapes=spec_profiling,
             )
             if profiling else nullcontext()
         )
@@ -1502,15 +1519,25 @@ class Engine:
         if profiling:
             torch.cuda.synchronize(self.device)
             assert prof is not None
+            profile_name = (
+                "speculative verify"
+                if spec_profiling
+                else f"prefill ({batch.input_ids.numel()} tokens)"
+            )
             logger.info(
-                "speculative verify profile (by CUDA time):\n%s",
+                "%s profile (by CUDA time):\n%s",
+                profile_name,
                 prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30),
             )
             logger.info(
-                "speculative verify profile (by CPU time):\n%s",
+                "%s profile (by CPU time):\n%s",
+                profile_name,
                 prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=30),
             )
-            self._spec_profile_left -= 1
+            if spec_profiling:
+                self._spec_profile_left -= 1
+            else:
+                self._prefill_profile_left -= 1
         if timing:
             target_end.record(self.stream)
         if self.cpu_moe_executor is not None:
