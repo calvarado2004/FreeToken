@@ -114,22 +114,28 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
+        cache = self.offload_cache
+        assert cache is not None
+        # A speculative verify is a decode wearing a prefill's clothes.  Decide that
+        # BEFORE the prompt-density crossover below: at the widest captured DSpark
+        # span, T*top_k can cover the expert set and used to enter whole-layer prefill
+        # streaming.  Capturing that path either depended on uncaptured copy-stream
+        # events (prefill overlap on) or materialized every expert into the graph and
+        # exhausted its private pool (overlap off).  Verification must stay on the
+        # on-demand/decode path at every legal span.
+        is_speculative = bool(getattr(get_global_ctx().batch, "speculative", False))
+        if is_speculative and cache.decode_target == "hybrid":
+            return self._decode_routed(hidden_states, topk_weights, topk_ids)
+
         # Whole-layer streaming moves all num_experts rows per layer; a small
         # chunk touches at most T*top_k of them, so below that crossover the
         # decode-style on-demand slot path strictly moves fewer bytes (and
         # keeps short-prompt slot residency -- hence hybrid decode's GPU/CPU
         # route split -- unchanged). Mixing modes across chunks is safe: the
         # streaming buffers disown their borrowed slots on invalidation.
-        if hidden_states.shape[0] * self.top_k >= self.num_experts:
+        if not is_speculative and hidden_states.shape[0] * self.top_k >= self.num_experts:
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
-        cache = self.offload_cache
-        assert cache is not None
 
-        # A speculative verify is a decode wearing a prefill's clothes. The scheduler
-        # marks the batch "prefill" because the block is an extend over several
-        # positions, but it carries block_size rows per request, not a prompt -- and it
-        # runs on the critical path of every decode step.
-        #
         # The path below fetches EVERY missing expert over PCIe, uncapped, with no CPU
         # overlap. That is the right trade for a prompt, where the fetch amortizes over
         # hundreds of tokens. For a 5-row block it moves up to T*top_k experts per layer
@@ -137,13 +143,8 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         # single-token step, which is the whole reason speculation lost to plain decode
         # here rather than a low acceptance rate.
         #
-        # Hybrid decode caps the fetch and overlaps the overflow on the CPU pool, which
-        # is what a handful of rows wants.
-        if (
-            getattr(get_global_ctx().batch, "speculative", False)
-            and cache.decode_target == "hybrid"
-        ):
-            return self._decode_routed(hidden_states, topk_weights, topk_ids)
+        # Hybrid verification returned above; a non-hybrid verification deliberately
+        # remains on this on-demand slot path rather than whole-layer prefill movement.
         cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
         cache.copy_missing()
         if cache.collect_stats:
