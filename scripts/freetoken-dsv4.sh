@@ -26,6 +26,11 @@ MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
 MAX_PREFILL_LENGTH="${MAX_PREFILL_LENGTH:-2048}"
 EXPERT_LOAD="${EXPERT_LOAD:-serial}"
 MOE_HYBRID_FETCH_FRACTION="${MOE_HYBRID_FETCH_FRACTION:-}"
+# Experimental cache-geometry pins.  Leave both unset for the proven auto-sized
+# production geometry.  During a cache sweep, set both so changing MoE residency
+# does not silently change KV capacity and confound the decode comparison.
+MOE_CACHE_SIZE="${MOE_CACHE_SIZE:-}"
+NUM_PAGES="${NUM_PAGES:-}"
 # SPECULATIVE_DSPARK=0 turns OFF the checkpoint's dSpark drafter (the mtp.* stack).
 # On by default: the draft/verify loop is wired, and dSpark is what the checkpoint was
 # trained to decode with. It costs 9.5 GiB of host expert banks and a slice of the GPU
@@ -138,8 +143,11 @@ cmd_start() {
     local hybrid_fraction=()
     [ -n "$MOE_HYBRID_FETCH_FRACTION" ] \
         && hybrid_fraction=(--moe-hybrid-fetch-fraction "$MOE_HYBRID_FETCH_FRACTION")
+    local cache_geometry=()
+    [ -n "$MOE_CACHE_SIZE" ] && cache_geometry+=(--moe-cache-size "$MOE_CACHE_SIZE")
+    [ -n "$NUM_PAGES" ] && cache_geometry+=(--num-pages "$NUM_PAGES")
 
-    echo "starting DeepSeek-V4-Flash on $HOST:$PORT (TP=$TP_SIZE, memory-ratio $MEMORY_RATIO${spec:+, dSpark drafter})"
+    echo "starting DeepSeek-V4-Flash on $HOST:$PORT (TP=$TP_SIZE, memory-ratio $MEMORY_RATIO${spec:+, dSpark drafter}${MOE_CACHE_SIZE:+, MoE slots $MOE_CACHE_SIZE}${NUM_PAGES:+, KV pages $NUM_PAGES}${MOE_HYBRID_FETCH_FRACTION:+, hybrid fetch $MOE_HYBRID_FETCH_FRACTION})"
     : > "$LOG"
     cd "$FT_DIR" || die "cannot cd to $FT_DIR"
     setsid "$FT" serve \
@@ -150,6 +158,7 @@ cmd_start() {
         --max-running-requests "$MAX_RUNNING_REQUESTS" \
         --max-prefill-length "$MAX_PREFILL_LENGTH" \
         --expert-load "$EXPERT_LOAD" \
+        "${cache_geometry[@]}" \
         "${hybrid_fraction[@]}" \
         "${spec[@]}" \
         "${fallback[@]}" \

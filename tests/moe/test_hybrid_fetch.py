@@ -6,14 +6,51 @@ per-step integer split (GPU kernel vs CPU reference mirror, and the balance rule
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from freetoken.engine.engine import Engine
 from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 from freetoken.moe.offload_cache import OffloadMoeCache
 
 Q = 1 << 16
+
+
+def test_explicit_hybrid_fetch_fraction_overrides_profile_and_fixed_cap():
+    engine = Engine.__new__(Engine)
+    config = SimpleNamespace(
+        moe_hybrid_fetch_fraction=0.24,
+        moe_hybrid_max_fetch=1,
+    )
+    cache = SimpleNamespace(
+        num_experts=256,
+        hybrid_max_fetch=1,
+        hybrid_fetch_fraction=0.0,
+    )
+
+    engine._resolve_hybrid_fetch(config, cache)
+
+    assert cache.hybrid_max_fetch == 256
+    assert cache.hybrid_fetch_fraction == pytest.approx(0.24)
+
+
+@pytest.mark.parametrize("fraction", [float("nan"), float("inf"), -0.01, 1.01])
+def test_explicit_hybrid_fetch_fraction_rejects_invalid_programmatic_config(fraction):
+    engine = Engine.__new__(Engine)
+    config = SimpleNamespace(
+        moe_hybrid_fetch_fraction=fraction,
+        moe_hybrid_max_fetch=-1,
+    )
+    cache = SimpleNamespace(
+        num_experts=256,
+        hybrid_max_fetch=-1,
+        hybrid_fetch_fraction=0.0,
+    )
+
+    with pytest.raises(ValueError, match="finite and in \\[0, 1\\]"):
+        engine._resolve_hybrid_fetch(config, cache)
 
 
 def _balanced_fetch(num_missing: int, frac_q16: int) -> int:

@@ -773,6 +773,11 @@ class Engine:
         """
         explicit_fraction = config.moe_hybrid_fetch_fraction
         if explicit_fraction is not None:
+            if not math.isfinite(explicit_fraction) or not 0.0 <= explicit_fraction <= 1.0:
+                raise ValueError(
+                    "--moe-hybrid-fetch-fraction must be finite and in [0, 1], "
+                    f"got {explicit_fraction!r}"
+                )
             cache.hybrid_max_fetch = cache.num_experts  # fraction becomes the cap
             cache.hybrid_fetch_fraction = explicit_fraction
             logger.info_rank0(
