@@ -54,6 +54,11 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    # Optional explicit form of the same split. None keeps the behavior above; a
+    # value in [0, 1] overrides both the cached auto profile and the fixed cap.
+    # This is useful when each TP rank owns fewer CPU workers than the machine-wide
+    # `ft bench bw` profile, or when multiple ranks contend on one NUMA node.
+    moe_hybrid_fetch_fraction: float | None = None
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1

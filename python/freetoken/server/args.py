@@ -109,6 +109,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _unit_fraction(value: str) -> float:
+        try:
+            fraction = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a number in [0, 1]") from exc
+        if not 0 <= fraction <= 1:
+            raise argparse.ArgumentTypeError("must be in [0, 1]")
+        return fraction
+
     def _infer_tool_call_parser(model_path: str) -> str:
         try:
             from freetoken.utils import cached_load_hf_config
@@ -596,6 +605,16 @@ def parse_args(
             "-1 (default) = auto: fetch the benched pcie/cpu bandwidth fraction of each "
             "step's misses (perfect overlap; needs an `ft bench bw` profile, else 1). "
             "0 = never fetch (all misses on CPU); large = behaves like plain offload."
+        ),
+    )
+    parser.add_argument(
+        "--moe-hybrid-fetch-fraction",
+        type=_unit_fraction,
+        default=ServerArgs.moe_hybrid_fetch_fraction,
+        help=(
+            "For --moe-backend hybrid: explicitly fetch this fraction of each step's "
+            "expert misses over PCIe. Overrides --moe-hybrid-max-fetch and the cached "
+            "auto bandwidth profile. Intended for measured NUMA/TP contention tuning."
         ),
     )
 

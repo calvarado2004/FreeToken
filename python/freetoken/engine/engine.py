@@ -771,6 +771,16 @@ class Engine:
         achieved bandwidths come from the cached `ft bench bw` profile (the same one the
         auto backend pick reads); without a usable profile the old fixed cap of 1 applies.
         """
+        explicit_fraction = config.moe_hybrid_fetch_fraction
+        if explicit_fraction is not None:
+            cache.hybrid_max_fetch = cache.num_experts  # fraction becomes the cap
+            cache.hybrid_fetch_fraction = explicit_fraction
+            logger.info_rank0(
+                "--moe-hybrid-fetch-fraction: fetching %.1f%% of each decode "
+                "step's expert misses over PCIe",
+                explicit_fraction * 100.0,
+            )
+            return
         if config.moe_hybrid_max_fetch >= 0:
             return  # explicit fixed cap
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
@@ -1804,6 +1814,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
+    "moe_hybrid_fetch_fraction": None,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",
