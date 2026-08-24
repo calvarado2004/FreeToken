@@ -2,7 +2,96 @@
 
 This is the execution plan after establishing the coherent approximately 30 tok/s coding
 baseline on Carlos Alvarado's 4 x RTX A4000 workstation. Estimates are experiment targets,
-not achieved-speed claims.
+not achieved-speed claims. Carlos makes the final call on what constitutes a baseline; this
+document keeps measurements, caveats and recommendations separate.
+
+## End-of-day checkpoint and immediate next steps
+
+The Lenovo is currently serving commit `6b3de2d` from
+`experiment/dsv4-tp4-drafter-graph`. The deployed systemd profile deliberately uses the more
+stable eager drafter (`FREETOKEN_DSPARK_DRAFT_GRAPH=0`) while retaining DSpark, the measured
+acceptance fallback, 2,048-token prefill chunks and the confirmed TP4 memory geometry. The
+service is active but deliberately disabled at boot.
+
+Pinned runtime geometry:
+
+- TP=4; memory ratio 0.80; MoE cache 2,016 slots; 477 KV pages.
+- Hybrid expert fetch fraction 0.28.
+- Acceptance fallback threshold/minimum/cooldown: 0.60 / 32 proposals / 64 target steps.
+- 61,056-token allocated full-KV capacity for prompt plus output, despite the checkpoint's
+  architectural 1,048,576-token context limit.
+- Final measured placement: 146.62 GiB of host experts and 55.24 GiB of GPU allocations,
+  reported as 72.6% CPU / 27.4% GPU for counted placement. Each NUMA node owns two TP ranks.
+- 1.26 GiB free GPU memory after target-verify graph capture.
+
+The matched rich pet-store workload showed why the drafter graph remains opt-in:
+
+| Same experiment commit and 9k limit | End-to-end | Steady mean | Steady jitter | Fallback activations |
+| --- | ---: | ---: | ---: | ---: |
+| Drafter graph enabled | 5,451 tokens / 217.775 s = 25.03 tok/s | 23.97 tok/s | 4.84 tok/s stddev | 12 |
+| Eager drafter | 7,168 tokens / 289.292 s = 24.78 tok/s | 24.23 tok/s | 3.72 tok/s stddev | 7 |
+
+The graph reduced the measured drafter stage to about 18.43 ms versus about 21.71 ms in the
+matched eager run, but yielded only about 1% end-to-end throughput at materially higher jitter
+and more fallback activations. Both responses were complete, coherent, non-repeating and judged
+visually excellent. Recommendation: keep eager as the release candidate and retain the graph
+behind its environment switch until its variance is understood.
+
+Work should resume in this order:
+
+1. **Freeze and reproduce the candidate.** Re-run one 6k pet-store coding control, one bounded
+   representative 20k-cap high-reasoning control, one 6k creative control and one OpenWebUI
+   long-history request from the exact systemd commit. Record request-local counters rather than
+   cumulative `spec:` percentages. Do not use adversarial open-ended proof prompts as routine
+   gates; reserve them for labeled stress tests.
+2. **Complete the TP4-aware hybrid split sweep.** With graph disabled, pin MoE=2,016 and
+   KV=477, then repeat fractions 0.20, 0.24, 0.28, 0.32 and 0.36. Compare repeated runs, not a
+   single best window. Preserve 2,048-token prefill and the fallback so each point differs only
+   in the split.
+3. **Sweep MoE residency only after selecting the split.** Try 2,080, 2,144 and 2,208 slots
+   while keeping 477 KV pages. Reject any point below 768 MiB post-capture free VRAM or showing
+   an OOM, quality loss or decode regression. Do not repeat the known failed auto-sized
+   2,509-slot / memory-ratio 0.90 capture.
+4. **Diagnose the drafter graph, do not promote it yet.** Profile the extra variance and fallback
+   entries, verify CUDA RNG/sampling semantics, and test whether graph replay changes scheduling
+   or synchronization around the sequential Markov sampler. A graph result must beat eager in
+   repeated end-to-end runs, not merely reduce the draft substage.
+5. **Try a one-token MTP/target fallback only as an isolated later experiment.** It is most
+   relevant when DSpark acceptance is persistently weak on reasoning or creative prose. Keep
+   code on DSpark when its measured acceptance remains high; never classify difficulty from the
+   prompt text.
+6. **Run the deferred stability matrix before release.** Include tool calls, repeated-token and
+   coherence checks, an OpenWebUI long-context request, a Qwen-Code-like large-instruction
+   request within allocated KV capacity, and four concurrent coding/reasoning requests. Treat
+   concurrency as a separate throughput/stability result because the current service pins one
+   running request.
+7. **Publish only confirmed gains.** Create a new protected PROD branch and a release on Carlos's
+   fork only after the exact candidate passes the matrix. Keep the existing recovery and PROD
+   branches immutable. PR #71 should receive independent net gains and their measurements; the
+   drafter graph should not be promoted upstream from the present A/B.
+
+The performance target remains approximately 35 tok/s for representative reasoning and 60 tok/s
+for coding. Reaching it is an experiment goal, not a claim. The present measured gamma=5 cycle
+cost explains the current approximately 30 tok/s coding region, so a large jump will require a
+material improvement in verify/draft cycle cost, accepted tokens per cycle, or both—not only a
+small launch-overhead reduction.
+
+## Operational handoff
+
+The full launch stream, including the ASCII art, all TP-rank loader output, NUMA distribution and
+API readiness, is mirrored to journald while `/tmp/freetoken-dsv4.log` remains available to the
+management script:
+
+```bash
+journalctl -u freetoken-dsv4.service -f -o cat
+sudo systemctl start freetoken-dsv4.service
+sudo systemctl stop freetoken-dsv4.service
+systemctl status freetoken-dsv4.service
+```
+
+Do not enable the service unless Carlos explicitly requests it. The six existing vLLM services
+were also confirmed disabled and inactive. Lenovo source deployment remains Git-only: commit and
+push a named branch, then fetch/switch/pull on the server. Source-file copies are forbidden.
 
 ## Hardware and bottleneck model
 
