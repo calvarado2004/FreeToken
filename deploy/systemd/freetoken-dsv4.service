@@ -16,7 +16,7 @@
 Description=FreeToken DeepSeek-V4-Flash TP4 (4x RTX A4000)
 After=network-online.target
 Wants=network-online.target
-ConditionPathIsExecutable=/home/carlos/FreeToken/scripts/freetoken-dsv4.sh
+ConditionPathExists=/home/carlos/FreeToken/scripts/freetoken-dsv4.sh
 
 [Service]
 Type=forking
@@ -48,11 +48,11 @@ Environment="DSPARK_FALLBACK_MIN_DRAFTED=32"
 Environment="DSPARK_FALLBACK_STEPS=64"
 Environment="FREETOKEN_DSPARK_DRAFT_GRAPH=0"
 
-ExecStart=/home/carlos/FreeToken/scripts/freetoken-dsv4.sh start
+ExecStart=/usr/bin/bash /home/carlos/FreeToken/scripts/freetoken-dsv4.sh start
 # Testing policy on this workstation: stop quickly, then reclaim the pinned
 # expert-bank shared memory that a SIGKILL would otherwise leave behind.
-ExecStop=/home/carlos/FreeToken/scripts/freetoken-dsv4.sh kill
-ExecStopPost=-/home/carlos/FreeToken/scripts/freetoken-dsv4.sh kill
+ExecStop=/usr/bin/bash /home/carlos/FreeToken/scripts/freetoken-dsv4.sh kill
+ExecStopPost=-/usr/bin/bash /home/carlos/FreeToken/scripts/freetoken-dsv4.sh kill
 
 TimeoutStartSec=2400
 TimeoutStopSec=30
