@@ -1,0 +1,68 @@
+# FreeToken DeepSeek-V4-Flash TP4 service for Carlos's 4x RTX A4000 workstation.
+#
+# Install without enabling or starting it:
+#   sudo install -m 0644 deploy/systemd/freetoken-dsv4.service \
+#     /etc/systemd/system/freetoken-dsv4.service
+#   sudo systemctl daemon-reload
+#
+# Start explicitly when wanted:
+#   sudo systemctl start freetoken-dsv4.service
+#
+# This unit deliberately pins the measured stable graph-off configuration. The
+# drafter-backbone CUDA graph remains available for experiments by changing
+# FREETOKEN_DSPARK_DRAFT_GRAPH to 1 in a drop-in.
+
+[Unit]
+Description=FreeToken DeepSeek-V4-Flash TP4 (4x RTX A4000)
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsExecutable=/home/carlos/FreeToken/scripts/freetoken-dsv4.sh
+
+[Service]
+Type=forking
+User=carlos
+Group=carlos
+WorkingDirectory=/home/carlos/FreeToken
+PIDFile=/tmp/freetoken-dsv4.pid
+
+Environment="HOME=/home/carlos"
+Environment="FT_DIR=/home/carlos/FreeToken"
+Environment="MODEL=/home/carlos/models/DeepSeek-V4-Flash-0731"
+Environment="HF_HOME=/home/carlos/.cache/huggingface"
+Environment="CUDA_DEVICE_ORDER=PCI_BUS_ID"
+Environment="CC=/usr/bin/gcc-15"
+Environment="CXX=/usr/bin/g++-15"
+Environment="CUDAHOSTCXX=/usr/bin/g++-15"
+
+# Confirmed 2026-08-23 TP4 release-candidate geometry and scheduler settings.
+Environment="MEMORY_RATIO=0.80"
+Environment="TP_SIZE=4"
+Environment="MAX_RUNNING_REQUESTS=1"
+Environment="MAX_PREFILL_LENGTH=2048"
+Environment="MOE_CACHE_SIZE=2016"
+Environment="NUM_PAGES=477"
+Environment="MOE_HYBRID_FETCH_FRACTION=0.28"
+Environment="SPECULATIVE_DSPARK=1"
+Environment="DSPARK_FALLBACK_ACCEPTANCE=0.60"
+Environment="DSPARK_FALLBACK_MIN_DRAFTED=32"
+Environment="DSPARK_FALLBACK_STEPS=64"
+Environment="FREETOKEN_DSPARK_DRAFT_GRAPH=0"
+
+ExecStart=/home/carlos/FreeToken/scripts/freetoken-dsv4.sh start
+# Testing policy on this workstation: stop quickly, then reclaim the pinned
+# expert-bank shared memory that a SIGKILL would otherwise leave behind.
+ExecStop=/home/carlos/FreeToken/scripts/freetoken-dsv4.sh kill
+ExecStopPost=-/home/carlos/FreeToken/scripts/freetoken-dsv4.sh kill
+
+TimeoutStartSec=2400
+TimeoutStopSec=30
+KillMode=control-group
+SendSIGKILL=yes
+Restart=on-failure
+RestartSec=10
+SuccessExitStatus=SIGKILL 137
+OOMScoreAdjust=-900
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
