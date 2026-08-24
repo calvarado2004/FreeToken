@@ -62,6 +62,10 @@ DSPARK_FALLBACK_STEPS="${DSPARK_FALLBACK_STEPS:-64}"
 # the fixed-shape drafter backbone graph. Unset captures/replays it when DSpark is on.
 [ -n "${FREETOKEN_DSPARK_DRAFT_GRAPH:-}" ] && export FREETOKEN_DSPARK_DRAFT_GRAPH
 LOG="${LOG:-/tmp/freetoken-dsv4.log}"
+# Keep the regular log for readiness checks and postmortems, while optionally
+# mirroring every engine line to the caller's stdout. The systemd unit enables
+# this so journalctl includes the banner, TP workers, loader, and runtime logs.
+LOG_TO_STDOUT="${FREETOKEN_LOG_TO_STDOUT:-0}"
 # The TP ranks' torch.distributed rendezvous. Held by every rank, not just the
 # frontend, so it is the one that lingers after a stop.
 RDZV_PORT="${RDZV_PORT:-8082}"
@@ -153,19 +157,25 @@ cmd_start() {
     echo "starting DeepSeek-V4-Flash on $HOST:$PORT (TP=$TP_SIZE, memory-ratio $MEMORY_RATIO${spec:+, dSpark drafter}${MOE_CACHE_SIZE:+, MoE slots $MOE_CACHE_SIZE}${NUM_PAGES:+, KV pages $NUM_PAGES}${MOE_HYBRID_FETCH_FRACTION:+, hybrid fetch $MOE_HYBRID_FETCH_FRACTION})"
     : > "$LOG"
     cd "$FT_DIR" || die "cannot cd to $FT_DIR"
-    setsid "$FT" serve \
-        --model "$MODEL" \
-        --host "$HOST" --port "$PORT" \
-        --tensor-parallel-size "$TP_SIZE" \
-        --memory-ratio "$MEMORY_RATIO" \
-        --max-running-requests "$MAX_RUNNING_REQUESTS" \
-        --max-prefill-length "$MAX_PREFILL_LENGTH" \
-        --expert-load "$EXPERT_LOAD" \
-        "${cache_geometry[@]}" \
-        "${hybrid_fraction[@]}" \
-        "${spec[@]}" \
-        "${fallback[@]}" \
-        >> "$LOG" 2>&1 < /dev/null &
+    local serve_cmd=(
+        "$FT" serve
+        --model "$MODEL"
+        --host "$HOST" --port "$PORT"
+        --tensor-parallel-size "$TP_SIZE"
+        --memory-ratio "$MEMORY_RATIO"
+        --max-running-requests "$MAX_RUNNING_REQUESTS"
+        --max-prefill-length "$MAX_PREFILL_LENGTH"
+        --expert-load "$EXPERT_LOAD"
+        "${cache_geometry[@]}"
+        "${hybrid_fraction[@]}"
+        "${spec[@]}"
+        "${fallback[@]}"
+    )
+    if [ "$LOG_TO_STDOUT" = "1" ]; then
+        setsid "${serve_cmd[@]}" > >(tee -a "$LOG") 2>&1 < /dev/null &
+    else
+        setsid "${serve_cmd[@]}" >> "$LOG" 2>&1 < /dev/null &
+    fi
     echo $! > "$PIDFILE"
 
     # The HTTP frontend binds BEFORE the model loads, so /v1/models answers 200 while

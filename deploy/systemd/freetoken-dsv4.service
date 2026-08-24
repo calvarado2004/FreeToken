@@ -47,6 +47,9 @@ Environment="DSPARK_FALLBACK_ACCEPTANCE=0.60"
 Environment="DSPARK_FALLBACK_MIN_DRAFTED=32"
 Environment="DSPARK_FALLBACK_STEPS=64"
 Environment="FREETOKEN_DSPARK_DRAFT_GRAPH=0"
+# Mirror the complete engine log to this unit's stdout/stderr so journalctl
+# includes the ASCII banner, loader, TP ranks, NUMA report, and runtime metrics.
+Environment="FREETOKEN_LOG_TO_STDOUT=1"
 
 ExecStart=/usr/bin/bash /home/carlos/FreeToken/scripts/freetoken-dsv4.sh start
 # Testing policy on this workstation: stop quickly, then reclaim the pinned
