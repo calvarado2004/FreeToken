@@ -17,6 +17,8 @@ Description=FreeToken DeepSeek-V4-Flash TP4 (4x RTX A4000)
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/home/carlos/FreeToken/scripts/freetoken-dsv4.sh
+ConditionPathExists=/etc/ssl/levelg.io/fullchain.pem
+ConditionPathExists=/etc/ssl/levelg.io/privkey.pem
 
 [Service]
 Type=forking
@@ -29,6 +31,9 @@ Environment="HOME=/home/carlos"
 Environment="FT_DIR=/home/carlos/FreeToken"
 Environment="MODEL=/home/carlos/models/DeepSeek-V4-Flash-0731"
 Environment="HF_HOME=/home/carlos/.cache/huggingface"
+Environment="SSL_CERTFILE=/etc/ssl/levelg.io/fullchain.pem"
+Environment="SSL_KEYFILE=/etc/ssl/levelg.io/privkey.pem"
+Environment="TLS_SERVER_NAME=lenovo-thinkstation.levelg.io"
 Environment="CUDA_DEVICE_ORDER=PCI_BUS_ID"
 Environment="CC=/usr/bin/gcc-15"
 Environment="CXX=/usr/bin/g++-15"

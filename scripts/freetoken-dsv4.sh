@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Start / stop DeepSeek-V4-Flash-0731 on the 4x RTX A4000, served on 0.0.0.0:8081.
+# Start / stop DeepSeek-V4-Flash-0731 on the 4x RTX A4000, served with HTTPS on
+# 0.0.0.0:8081 as lenovo-thinkstation.levelg.io.
 #
 #   ./freetoken-dsv4.sh start     start it (returns when it is really ready)
 #   ./freetoken-dsv4.sh stop      stop it cleanly (add --force to escalate)
@@ -17,6 +18,9 @@ FT_DIR="${FT_DIR:-$HOME/FreeToken}"
 MODEL="${MODEL:-$HOME/models/DeepSeek-V4-Flash-0731}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8081}"
+SSL_CERTFILE="${SSL_CERTFILE:-/etc/ssl/levelg.io/fullchain.pem}"
+SSL_KEYFILE="${SSL_KEYFILE:-/etc/ssl/levelg.io/privkey.pem}"
+TLS_SERVER_NAME="${TLS_SERVER_NAME:-lenovo-thinkstation.levelg.io}"
 TP_SIZE="${TP_SIZE:-4}"
 # 0.80 leaves the measured 1.26 GiB headroom after DSpark graph capture on this
 # workstation. At 0.90 a fully free restart can auto-size 2509 MoE slots (instead of
@@ -115,6 +119,8 @@ service_pids() {
 cmd_start() {
     [ -x "$FT" ] || die "no ft binary at $FT (run: cd $FT_DIR && uv venv && uv pip install -e '.[accel]')"
     [ -d "$MODEL" ] || die "no model directory at $MODEL"
+    [ -r "$SSL_CERTFILE" ] || die "TLS certificate is not readable: $SSL_CERTFILE"
+    [ -r "$SSL_KEYFILE" ] || die "TLS private key is not readable: $SSL_KEYFILE"
     if running_pid >/dev/null; then
         echo "already running (pid $(running_pid)) on $HOST:$PORT"; return 0
     fi
@@ -154,13 +160,15 @@ cmd_start() {
     [ -n "$MOE_CACHE_SIZE" ] && cache_geometry+=(--moe-cache-size "$MOE_CACHE_SIZE")
     [ -n "$NUM_PAGES" ] && cache_geometry+=(--num-pages "$NUM_PAGES")
 
-    echo "starting DeepSeek-V4-Flash on $HOST:$PORT (TP=$TP_SIZE, memory-ratio $MEMORY_RATIO${spec:+, dSpark drafter}${MOE_CACHE_SIZE:+, MoE slots $MOE_CACHE_SIZE}${NUM_PAGES:+, KV pages $NUM_PAGES}${MOE_HYBRID_FETCH_FRACTION:+, hybrid fetch $MOE_HYBRID_FETCH_FRACTION})"
+    echo "starting DeepSeek-V4-Flash with HTTPS on $HOST:$PORT (TP=$TP_SIZE, memory-ratio $MEMORY_RATIO${spec:+, dSpark drafter}${MOE_CACHE_SIZE:+, MoE slots $MOE_CACHE_SIZE}${NUM_PAGES:+, KV pages $NUM_PAGES}${MOE_HYBRID_FETCH_FRACTION:+, hybrid fetch $MOE_HYBRID_FETCH_FRACTION})"
     : > "$LOG"
     cd "$FT_DIR" || die "cannot cd to $FT_DIR"
     local serve_cmd=(
         "$FT" serve
         --model "$MODEL"
         --host "$HOST" --port "$PORT"
+        --ssl-certfile "$SSL_CERTFILE"
+        --ssl-keyfile "$SSL_KEYFILE"
         --tensor-parallel-size "$TP_SIZE"
         --memory-ratio "$MEMORY_RATIO"
         --max-running-requests "$MAX_RUNNING_REQUESTS"
@@ -185,7 +193,7 @@ cmd_start() {
     while [ "$waited" -lt "$START_TIMEOUT" ]; do
         if grep -aq "ready to serve" "$LOG"; then
             echo
-            echo "ready on $HOST:$PORT after ${waited}s"
+            echo "ready with HTTPS on $HOST:$PORT after ${waited}s"
             grep -a "moe_cache_size\|Allocating .* tokens\|Weights:" "$LOG" \
                 | sed "s/.*INFO *//" | sed "s/\x1b\[[0-9;]*m//g" | cut -c1-120 | tail -3
             return 0
@@ -296,8 +304,11 @@ cmd_kill() {
 }
 
 cmd_status() {
-    if grep -aq "ready to serve" "$LOG" 2>/dev/null && curl -sf -m 5 -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then
-        echo "UP on $HOST:$PORT"
+    if grep -aq "ready to serve" "$LOG" 2>/dev/null \
+        && curl -sf -m 5 --noproxy '*' \
+            --resolve "$TLS_SERVER_NAME:$PORT:127.0.0.1" -o /dev/null \
+            "https://$TLS_SERVER_NAME:$PORT/v1/models"; then
+        echo "HTTPS UP on $HOST:$PORT"
     elif running_pid >/dev/null; then
         echo "LOADING (pid $(running_pid)) -- not ready yet"
         tail -c 300 "$LOG" 2>/dev/null | tr '\r' '\n' | grep -a . | tail -1
@@ -313,7 +324,9 @@ cmd_status() {
 cmd_logs() { tail -f "$LOG"; }
 
 cmd_test() {
-    curl -sf -m 300 "http://127.0.0.1:$PORT/v1/chat/completions" \
+    curl -sf -m 300 --noproxy '*' \
+        --resolve "$TLS_SERVER_NAME:$PORT:127.0.0.1" \
+        "https://$TLS_SERVER_NAME:$PORT/v1/chat/completions" \
         -H 'Content-Type: application/json' \
         -d '{"model":"DeepSeek-V4-Flash-0731",
              "messages":[{"role":"user","content":"Say hello in one short sentence."}],

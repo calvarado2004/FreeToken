@@ -939,6 +939,16 @@ def _serve_and_run_shell(host: str, port: int) -> None:
         _reap_backend_workers(_GLOBAL_STATE.backend_processes)
 
 
+def _uvicorn_tls_kwargs(config: ServerArgs) -> dict[str, str]:
+    """Return uvicorn's HTTPS settings after the CLI has validated the pair."""
+    if not config.ssl_certfile:
+        return {}
+    return {
+        "ssl_certfile": config.ssl_certfile,
+        "ssl_keyfile": config.ssl_keyfile,
+    }
+
+
 def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_shell: bool) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
@@ -1075,4 +1085,4 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, **_uvicorn_tls_kwargs(config))
