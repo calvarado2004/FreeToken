@@ -40,6 +40,8 @@ parsers all resolve automatically from the checkpoint and the GPU.
 |---|---|---|
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
+| `--ssl-certfile` | disabled | PEM certificate chain for HTTPS; requires `--ssl-keyfile` |
+| `--ssl-keyfile` | disabled | PEM private key for HTTPS; requires `--ssl-certfile` |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
 | `--tensor-parallel-size`, `--tp-size` | 1 | GPUs to shard the model over; one scheduler process per rank, mapped in `--gpu` order (default: rank `i` on `cuda:i`) |
 | `--distributed-timeout` | 1800 | Seconds a TP collective waits before failing; sized for the per-rank skew in weight-load time |
@@ -49,6 +51,14 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
+
+To serve HTTPS directly, provide the certificate and private key together:
+
+```bash
+ft serve --model ... --host 0.0.0.0 \
+  --ssl-certfile /etc/ssl/example/fullchain.pem \
+  --ssl-keyfile /etc/ssl/example/privkey.pem
+```
 
 ### Choosing a GPU
 
