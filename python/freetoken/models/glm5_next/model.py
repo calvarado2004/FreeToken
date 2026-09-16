@@ -176,7 +176,10 @@ class Glm5NextMTPLayer(BaseOP):
         self.input_layernorm = RMSNorm(size=hidden, eps=eps)
         self.self_attn = Glm5NextAttention(config, layer_id, prefix=f"{prefix}.self_attn")
         self.post_attention_layernorm = RMSNorm(size=hidden, eps=eps)
-        self.mlp = Glm5NextSparseBlock(config, layer_id, prefix=f"{prefix}.mlp")
+        # The checkpoint's quant config names this layer's experts block-FP8; they are served
+        # re-quantized to NVFP4 (iter_mtp_expert_pieces), so the MoE takes the last decoder
+        # layer's scheme -- one offload cache holds one expert format.
+        self.mlp = Glm5NextSparseBlock(config, layer_id, prefix=f"model.layers.{config.num_layers - 1}.mlp")
         self.shared_head = _SharedHead(hidden, eps)
 
     @nvtx_annotate("MTP")
