@@ -16,6 +16,8 @@ set -uo pipefail
 
 FT_DIR="${FT_DIR:-$HOME/FreeToken}"
 MODEL="${MODEL:-$HOME/models/DeepSeek-V4-Flash-0731}"
+MODEL_LABEL="${MODEL_LABEL:-DeepSeek-V4-Flash}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$(basename "$MODEL")}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8081}"
 SSL_CERTFILE="${SSL_CERTFILE:-/etc/ssl/levelg.io/fullchain.pem}"
@@ -32,6 +34,8 @@ MOE_HYBRID_FETCH_FRACTION="${MOE_HYBRID_FETCH_FRACTION:-}"
 # does not silently change KV capacity and confound the decode comparison.
 MOE_CACHE_SIZE="${MOE_CACHE_SIZE:-}"
 NUM_PAGES="${NUM_PAGES:-}"
+# KV-token floor held back before --moe-cache-auto fills the GPU with experts (engine default 8192).
+KV_RESERVE_TOKENS="${KV_RESERVE_TOKENS:-}"
 # SPECULATIVE_DSPARK=0 turns OFF the checkpoint's dSpark drafter (the mtp.* stack).
 # On by default: the draft/verify loop is wired, and dSpark is what the checkpoint was
 # trained to decode with. It costs 9.5 GiB of host expert banks and a slice of the GPU
@@ -153,8 +157,9 @@ cmd_start() {
     local cache_geometry=()
     [ -n "$MOE_CACHE_SIZE" ] && cache_geometry+=(--moe-cache-size "$MOE_CACHE_SIZE")
     [ -n "$NUM_PAGES" ] && cache_geometry+=(--num-pages "$NUM_PAGES")
+    [ -n "$KV_RESERVE_TOKENS" ] && cache_geometry+=(--kv-reserve-tokens "$KV_RESERVE_TOKENS")
 
-    echo "starting DeepSeek-V4-Flash with HTTPS on $HOST:$PORT (TP=$TP_SIZE, memory-ratio $MEMORY_RATIO${spec:+, dSpark drafter}${MOE_CACHE_SIZE:+, MoE slots $MOE_CACHE_SIZE}${NUM_PAGES:+, KV pages $NUM_PAGES}${MOE_HYBRID_FETCH_FRACTION:+, hybrid fetch $MOE_HYBRID_FETCH_FRACTION})"
+    echo "starting $MODEL_LABEL with HTTPS on $HOST:$PORT (TP=$TP_SIZE, memory-ratio $MEMORY_RATIO${spec:+, dSpark drafter}${MOE_CACHE_SIZE:+, MoE slots $MOE_CACHE_SIZE}${NUM_PAGES:+, KV pages $NUM_PAGES}${MOE_HYBRID_FETCH_FRACTION:+, hybrid fetch $MOE_HYBRID_FETCH_FRACTION})"
     : > "$LOG"
     cd "$FT_DIR" || die "cannot cd to $FT_DIR"
     local serve_cmd=(
@@ -322,7 +327,7 @@ cmd_test() {
         --resolve "$TLS_SERVER_NAME:$PORT:127.0.0.1" \
         "https://$TLS_SERVER_NAME:$PORT/v1/chat/completions" \
         -H 'Content-Type: application/json' \
-        -d '{"model":"DeepSeek-V4-Flash-0731",
+        -d '{"model":"'"$SERVED_MODEL_NAME"'",
              "messages":[{"role":"user","content":"Say hello in one short sentence."}],
              "max_tokens":32}' \
     && echo

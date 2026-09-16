@@ -1,0 +1,63 @@
+# FreeToken GLM-5.3-Flash NVFP4 TP4 service for Carlos's 4x RTX A4000 workstation.
+#
+# RedHatAI/GLM-5.3-Flash-NVFP4: the NVFP4 export whose routed experts run on Ampere through
+# the Triton NVFP4 kernel and the hybrid CPU executor; attention, KDA and dense layers are bf16.
+#
+# Install without enabling it -- the toggle switcher owns which inference unit runs:
+#   sudo install -m 0644 deploy/systemd/freetoken-glm53.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+
+[Unit]
+Description=FreeToken GLM-5.3-Flash NVFP4 TP4 (4x RTX A4000)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/home/carlos/FreeToken/scripts/freetoken-glm53.sh
+ConditionPathExists=/home/carlos/models/GLM-5.3-Flash-NVFP4/config.json
+ConditionPathExists=/etc/ssl/levelg.io/fullchain.pem
+ConditionPathExists=/etc/ssl/levelg.io/privkey.pem
+
+[Service]
+Type=forking
+User=carlos
+Group=carlos
+WorkingDirectory=/home/carlos/FreeToken
+PIDFile=/tmp/freetoken-glm53.pid
+
+Environment="HOME=/home/carlos"
+Environment="FT_DIR=/home/carlos/FreeToken"
+Environment="MODEL=/home/carlos/models/GLM-5.3-Flash-NVFP4"
+Environment="LOG=/tmp/freetoken-glm53.log"
+Environment="PIDFILE=/tmp/freetoken-glm53.pid"
+Environment="HF_HOME=/home/carlos/.cache/huggingface"
+Environment="SSL_CERTFILE=/etc/ssl/levelg.io/fullchain.pem"
+Environment="SSL_KEYFILE=/etc/ssl/levelg.io/privkey.pem"
+Environment="TLS_SERVER_NAME=lenovo-thinkstation.levelg.io"
+Environment="CUDA_DEVICE_ORDER=PCI_BUS_ID"
+Environment="CC=/usr/bin/gcc-15"
+Environment="CXX=/usr/bin/g++-15"
+Environment="CUDAHOSTCXX=/usr/bin/g++-15"
+
+Environment="MEMORY_RATIO=0.80"
+Environment="TP_SIZE=4"
+Environment="MAX_RUNNING_REQUESTS=1"
+Environment="MAX_PREFILL_LENGTH=2048"
+Environment="EXPERT_LOAD=serial"
+Environment="KV_RESERVE_TOKENS=131072"
+Environment="FREETOKEN_LOG_TO_STDOUT=1"
+
+ExecStart=/usr/bin/bash /home/carlos/FreeToken/scripts/freetoken-glm53.sh start
+ExecStop=/usr/bin/bash /home/carlos/FreeToken/scripts/freetoken-glm53.sh kill
+ExecStopPost=-/usr/bin/bash /home/carlos/FreeToken/scripts/freetoken-glm53.sh kill
+
+TimeoutStartSec=3000
+TimeoutStopSec=30
+KillMode=control-group
+SendSIGKILL=yes
+Restart=on-failure
+RestartSec=10
+SuccessExitStatus=SIGKILL 137
+OOMScoreAdjust=-900
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
