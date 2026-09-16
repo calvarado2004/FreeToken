@@ -12,7 +12,7 @@ import torch
 from freetoken.layers import BaseOP, swiglu_clamp_and_mul
 from freetoken.utils import nvtx_annotate
 
-from freetoken.layers import LinearReplicated
+from freetoken.layers import LinearColParallelMerged, LinearReplicated, LinearRowParallel
 
 
 class Glm5NextGatedMLP(BaseOP):
@@ -23,12 +23,17 @@ class Glm5NextGatedMLP(BaseOP):
         swiglu_limit: float | None = None,
         *,
         has_bias: bool = False,
+        tensor_parallel: bool = False,
         quant_config=None,
         prefix: str = "",
     ):
-        self.gate_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.gate_proj")
-        self.up_proj = LinearReplicated(hidden_size, intermediate_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.up_proj")
-        self.down_proj = LinearReplicated(intermediate_size, hidden_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.down_proj")
+        # The decoder MLPs split their intermediate dim under TP (gate/up column-, down row-parallel,
+        # which all-reduces); the vision tower runs per rank and keeps every projection replicated.
+        col = (lambda i, o, **kw: LinearColParallelMerged(i, [o], **kw)) if tensor_parallel else LinearReplicated
+        row = LinearRowParallel if tensor_parallel else LinearReplicated
+        self.gate_proj = col(hidden_size, intermediate_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.gate_proj")
+        self.up_proj = col(hidden_size, intermediate_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.up_proj")
+        self.down_proj = row(intermediate_size, hidden_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.down_proj")
         self.swiglu_limit = swiglu_limit
 
     @nvtx_annotate("MLP")
