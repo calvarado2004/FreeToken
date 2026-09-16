@@ -27,13 +27,17 @@ class Glm5NextGatedMLP(BaseOP):
         quant_config=None,
         prefix: str = "",
     ):
-        # The decoder MLPs split their intermediate dim under TP (gate/up column-, down row-parallel,
-        # which all-reduces); the vision tower runs per rank and keeps every projection replicated.
-        col = (lambda i, o, **kw: LinearColParallelMerged(i, [o], **kw)) if tensor_parallel else LinearReplicated
-        row = LinearRowParallel if tensor_parallel else LinearReplicated
-        self.gate_proj = col(hidden_size, intermediate_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.gate_proj")
-        self.up_proj = col(hidden_size, intermediate_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.up_proj")
-        self.down_proj = row(intermediate_size, hidden_size, has_bias=has_bias, quant_config=quant_config, prefix=f"{prefix}.down_proj")
+        # The decoder MLPs split their intermediate dim under TP (down all-reduces); the vision
+        # tower runs whole on every rank, so its projections stay replicated.
+        kw = dict(has_bias=has_bias, quant_config=quant_config)
+        if tensor_parallel:
+            self.gate_proj = LinearColParallelMerged(hidden_size, [intermediate_size], prefix=f"{prefix}.gate_proj", **kw)
+            self.up_proj = LinearColParallelMerged(hidden_size, [intermediate_size], prefix=f"{prefix}.up_proj", **kw)
+            self.down_proj = LinearRowParallel(intermediate_size, hidden_size, prefix=f"{prefix}.down_proj", **kw)
+        else:
+            self.gate_proj = LinearReplicated(hidden_size, intermediate_size, prefix=f"{prefix}.gate_proj", **kw)
+            self.up_proj = LinearReplicated(hidden_size, intermediate_size, prefix=f"{prefix}.up_proj", **kw)
+            self.down_proj = LinearReplicated(intermediate_size, hidden_size, prefix=f"{prefix}.down_proj", **kw)
         self.swiglu_limit = swiglu_limit
 
     @nvtx_annotate("MLP")
