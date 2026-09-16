@@ -431,6 +431,12 @@ class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        if getattr(config, "speculative_mtp", False):
+            # A rank process receives the config pickled, without __post_init__: the weight
+            # readers re-parse the checkpoint here and must see the same MTP layers.
+            from freetoken.models.glm5_next.args import set_mtp_enabled
+
+            set_mtp_enabled(True)
         set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
         _ensure_expandable_segments()  # before the first CUDA allocation below
         # Bind BEFORE any allocation: the expert banks land on the node that

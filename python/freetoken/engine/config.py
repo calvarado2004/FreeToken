@@ -100,6 +100,8 @@ class EngineConfig:
     # DeepSeek-V4 only: build the checkpoint's dSpark drafter for block speculative
     # decoding. Reaches the model through dsv4_args.dspark_enabled (_adjust_dsv4_config).
     speculative_dspark: bool = False
+    # GLM-5.3-Flash only: serve the checkpoint's MTP layer for speculative decoding.
+    speculative_mtp: bool = False
     # Experimental, request-local DSpark circuit breaker. 0 disables it. Once at least
     # dspark_fallback_min_drafted proposals have been measured below this acceptance
     # rate, use ordinary target decode for dspark_fallback_steps steps, then probe the
@@ -117,6 +119,10 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        if self.speculative_mtp:
+            from freetoken.models.glm5_next.args import set_mtp_enabled
+
+            set_mtp_enabled(True)  # before model_config is first parsed in this process
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":

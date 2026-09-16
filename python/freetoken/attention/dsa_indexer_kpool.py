@@ -87,8 +87,8 @@ class Glm5NextDSABackend(DSAAttnBackend):
 
     def _build_index_slots(self, args, config: "ModelConfig") -> None:
         # No IndexShare: every DSA layer owns its indexer and is its own leader.
-        for lid in args.dsa_layer_ids:
-            if lid >= config.num_layers:
+        for lid in tuple(args.dsa_layer_ids) + tuple(args.mtp_layer_ids):
+            if lid >= config.num_layers and lid not in args.mtp_layer_ids:
                 continue
             self._idx_slot[lid] = len(self._idx_slot)
             self._leader[lid] = lid

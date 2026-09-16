@@ -315,6 +315,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--speculative-mtp",
+        action="store_true",
+        dest="speculative_mtp",
+        default=False,
+        help=(
+            "GLM-5.3-Flash only: serve the checkpoint's MTP layer (num_nextn_predict_layers) "
+            "as the speculative drafter. Its routed experts join the host banks and the GPU "
+            "expert cache as one more MoE layer."
+        ),
+    )
+
+    parser.add_argument(
         "--dspark-fallback-acceptance",
         type=_parse_moe_cache_rate,
         default=ServerArgs.dspark_fallback_acceptance,

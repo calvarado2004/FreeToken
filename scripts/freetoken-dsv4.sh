@@ -43,6 +43,8 @@ KV_RESERVE_TOKENS="${KV_RESERVE_TOKENS:-}"
 # disappear from the log's `layers=` count, which is the quickest way to tell which
 # mode a run was in.
 SPECULATIVE_DSPARK="${SPECULATIVE_DSPARK:-1}"
+# SPECULATIVE_MTP=1 serves a GLM-5.3-Flash checkpoint's MTP layer (--speculative-mtp).
+SPECULATIVE_MTP="${SPECULATIVE_MTP:-0}"
 # Request-local circuit breaker: persistently weak drafts fall back to target-only decode.
 # 0.60/32/64 is the measured Lenovo A/B setting; DSPARK_FALLBACK_ACCEPTANCE=0 disables it.
 DSPARK_FALLBACK_ACCEPTANCE="${DSPARK_FALLBACK_ACCEPTANCE:-0.60}"
@@ -143,6 +145,7 @@ cmd_start() {
 
     local spec=()
     [ "$SPECULATIVE_DSPARK" = "1" ] && spec=(--speculative-dspark)
+    [ "$SPECULATIVE_MTP" = "1" ] && spec+=(--speculative-mtp)
     local fallback=()
     if [ "$DSPARK_FALLBACK_ACCEPTANCE" != "0" ] && [ "$DSPARK_FALLBACK_ACCEPTANCE" != "0.0" ]; then
         fallback=(
