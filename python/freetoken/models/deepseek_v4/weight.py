@@ -305,9 +305,14 @@ def iter_expert_pieces(
                             # the column axis, so it is read whole and cut below.
                             rows = f.get_slice(name)
                             lo, step = _i_block(role, rows.get_shape()[0], rank=tp.rank, tp_size=tp.size)
-                            yield name, rows[lo:lo + step].clone(memory_format=torch.contiguous_format)
+                            piece = rows[lo:lo + step].clone(memory_format=torch.contiguous_format)
+                            # A live slice handle keeps the whole shard mapped, and mapped
+                            # pages survive the cache drop below -- half the shard, measured.
+                            del rows
                         else:
-                            yield name, shard_expert_piece(role, f.get_tensor(name), rank=tp.rank, tp_size=tp.size)
+                            piece = shard_expert_piece(role, f.get_tensor(name), rank=tp.rank, tp_size=tp.size)
+                        yield name, piece
+                        del piece
             finally:
                 drop_page_cache(path)
 
