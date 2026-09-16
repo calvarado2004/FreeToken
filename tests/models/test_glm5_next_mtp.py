@@ -66,8 +66,12 @@ def test_nvfp4_quantizer_round_trips_through_the_bank_dequant():
     rebuilt = _dequant(packed, scale, global_scale)
     rel = (rebuilt - w).norm() / w.norm()
     assert rel < 0.12, f"NVFP4 round trip error {rel:.3f}"
-    # the low nibble holds the even element
-    assert torch.equal(packed[3, 2] & 0xF, torch.bucketize(torch.tensor(0), torch.tensor([0])).to(torch.uint8) * 0 + (packed[3, 2] & 0xF))
+
+    # the low nibble holds the even element: +6 at column 0, -3 at column 1 of one block
+    exact = torch.zeros(1, 16)
+    exact[0, 0], exact[0, 1] = 6.0, -3.0
+    packed, _, _ = quantize_nvfp4(exact)
+    assert int(packed[0, 0]) & 0xF == 7 and int(packed[0, 0]) >> 4 == 0b1101
 
 
 def test_the_mtp_layer_joins_the_dsa_group_the_indexer_and_the_banks():
@@ -102,7 +106,8 @@ def test_mtp_weights_match_the_rank_model(tmp_path, tp):
     config = _mtp_config(shapes)
     with torch.device("meta"):
         full_model = Glm5NextForCausalLM(config)
-    mtp_full = {k: v for k, v in full_model.state_dict().items() if k.startswith("mtp_layers.")}
+    # routed experts reach the offload banks as pieces, never through iter_weights
+    mtp_full = {k: v for k, v in full_model.state_dict().items() if k.startswith("mtp_layers.") and ".mlp.experts." not in k}
     assert mtp_full, "the MTP layer was not built"
 
     g = torch.Generator().manual_seed(1)
@@ -121,6 +126,6 @@ def test_mtp_weights_match_the_rank_model(tmp_path, tp):
     info_mod._TP_INFO = DistributedInfo(0, tp)
     with torch.device("meta"):
         model = Glm5NextForCausalLM(_mtp_config(shapes))
-    declared = {k: tuple(v.shape) for k, v in model.state_dict().items() if k.startswith("mtp_layers.")}
+    declared = {k: tuple(v.shape) for k, v in model.state_dict().items() if k.startswith("mtp_layers.") and ".mlp.experts." not in k}
     loaded = {k: tuple(v.shape) for k, v in iter_weights(str(tmp_path), torch.device("cpu"), include_moe_experts=False, include_non_moe=True, include_vision=False) if k.startswith("mtp_layers.")}
     assert loaded == declared
