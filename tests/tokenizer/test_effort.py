@@ -131,3 +131,20 @@ def test_probe_skips_rounds_whose_baseline_fails():
     profile = probe_effort_profile(render)
     assert profile.supported == frozenset({"xhigh", "medium", "low"})
     assert profile.consumes_effort
+
+
+def test_probe_drops_names_a_template_coerces_to_its_default():
+    # GLM-5.3-Flash: only low and high change the prompt; every other value -- and no value --
+    # renders "Reasoning Effort: Max". medium is therefore max under another name, and serving
+    # it would label a max-effort request "medium".
+    from freetoken.tokenizer.effort import effective_efforts
+
+    def render(kwargs, tools):
+        effort = kwargs.get("reasoning_effort")
+        return "Effort: " + (effort if effort in ("low", "high") else "max")
+
+    profile = probe_effort_profile(render)
+    assert profile.default == "max"
+    assert effective_efforts(profile) == frozenset({"low", "high", "max"})
+    # medium (0.7) is beyond the quantize threshold of high (0.9), so it is dropped, not re-labelled
+    assert quantize_effort("medium", profile) is None

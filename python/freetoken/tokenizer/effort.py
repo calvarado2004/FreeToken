@@ -58,7 +58,9 @@ def effective_efforts(profile: EffortProfile) -> frozenset[str]:
     if profile.validates or profile.supported != frozenset(KNOWN_REASONING_EFFORTS):
         return profile.supported
     ladder = GRADED_EFFORT_LADDER if profile.strength_dialect else OPENAI_EFFORT_TRIPLE
-    vocab = {name for name in ladder if name in profile.supported}
+    # A name that renders exactly like the default is the template coercing it (GLM-5.3 maps
+    # anything but low/high to max), not a level of its own.
+    vocab = {name for name in ladder if name in profile.supported and name not in profile.aliases}
     if profile.default:
         vocab.add(profile.default)
     return frozenset(vocab)
@@ -92,6 +94,8 @@ class EffortProfile:
     consumes_effort: bool
     validates: bool = False
     strength_dialect: bool = False
+    #: accepted names whose rendering equals the no-effort baseline, other than ``default``
+    aliases: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -216,16 +220,22 @@ def probe_effort_profile(
     supported = frozenset(name for name in KNOWN_REASONING_EFFORTS if name not in rejected)
     consumes = bool(rejected or diverged)
     default = None
+    aliases: frozenset[str] = frozenset()
     if consumes:
         defaults = [name for name in supported if matches_baseline[name]]
         if defaults:
-            default = max(defaults, key=lambda name: EFFORT_SCALE[name])
+            # xhigh and max share a scale point; the later name in EFFORT_SCALE wins so the
+            # choice does not depend on set iteration order.
+            order = {name: i for i, name in enumerate(EFFORT_SCALE)}
+            default = max(defaults, key=lambda name: (EFFORT_SCALE[name], order[name]))
+            aliases = frozenset(defaults) - {default}
     return EffortProfile(
         supported=supported,
         default=default,
         consumes_effort=consumes,
         validates=bool(rejected),
         strength_dialect=strength_dialect,
+        aliases=aliases,
     )
 
 
