@@ -256,14 +256,24 @@ class Glm5NextForCausalLM(BaseLLMModel):
         next_ids = torch.cat([ids[1:], ids[-1:]])
         embeds = self.model.embed_tokens.forward(next_ids)
         mtp_h = self.mtp_layers.op_list[0].forward(embeds, batch.positions.view(-1), hidden)
-        agree = total = 0
-        for lo in range(0, n - 2, 512):
-            hi = min(lo + 512, n - 2)
+        # MTP row t sees token t+1 and the target hidden at t, so it should predict token t+2: the
+        # target's own argmax at t+1 and the prompt's token t+2. The t / t+2 columns catch an
+        # off-by-one; the target-vs-truth column says how predictable the text itself is.
+        counts = {"target@t+1": 0, "target@t": 0, "target@t+2": 0, "truth@t+2": 0, "target_vs_truth": 0}
+        total = 0
+        for lo in range(1, n - 3, 512):
+            hi = min(lo + 512, n - 3)
             draft = self.full_logits(mtp_h[lo:hi]).argmax(-1)
-            target = self.full_logits(hidden[lo + 1:hi + 1]).argmax(-1)
-            agree += int((draft == target).sum())
+            target = self.full_logits(hidden[lo - 1:hi + 2]).argmax(-1)  # rows lo-1 .. hi+1
+            t0 = target[1:hi - lo + 1]
+            counts["target@t"] += int((draft == t0).sum())
+            counts["target@t+1"] += int((draft == target[2:hi - lo + 2]).sum())
+            counts["target@t+2"] += int((draft == target[3:hi - lo + 3]).sum())
+            counts["truth@t+2"] += int((draft == ids[lo + 2:hi + 2]).sum())
+            counts["target_vs_truth"] += int((target[2:hi - lo + 2] == ids[lo + 2:hi + 2]).sum())
             total += hi - lo
-        logger.info_rank0(f"MTP probe: {agree}/{total} teacher-forced top-1 agreement ({100.0 * agree / max(total, 1):.1f}%)")
+        summary = ", ".join(f"{k} {100.0 * v / max(total, 1):.1f}%" for k, v in counts.items())
+        logger.info_rank0(f"MTP probe over {total} positions: {summary}")
 
     def prepare_for_runtime(self) -> None:
         """Post-load, pre-KV-sizing hook: materialize the DSA layers' bmm-ready
