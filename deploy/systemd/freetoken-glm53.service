@@ -43,9 +43,9 @@ Environment="MAX_RUNNING_REQUESTS=1"
 Environment="MAX_PREFILL_LENGTH=2048"
 Environment="EXPERT_LOAD=serial"
 Environment="KV_RESERVE_TOKENS=131072"
-# MTP speculative decoding: up to 2 drafts per block, verify and MTP draft steps as CUDA graphs.
+# MTP speculative decoding: up to 3 drafts per block, verify and MTP draft steps as CUDA graphs.
 Environment="SPECULATIVE_MTP=1"
-Environment="SPECULATIVE_MTP_STEPS=2"
+Environment="SPECULATIVE_MTP_STEPS=3"
 Environment="FREETOKEN_LOG_TO_STDOUT=1"
 
 ExecStart=/usr/bin/bash /home/carlos/FreeToken/scripts/freetoken-glm53.sh start
