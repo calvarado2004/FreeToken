@@ -497,6 +497,9 @@ class Glm5NextForCausalLM(BaseLLMModel):
             "hidden": torch.zeros(max_span, hidden_size, dtype=torch.bfloat16, device=dev),
         }
         slot = dummy_req.linear_slot_idx if dummy_req.linear_slot_idx is not None else dummy_req.table_idx
+        # A private pool: these graphs replay between the target verify graphs' replays, out of
+        # capture order, so they must not share scratch blocks with them.
+        pool = torch.cuda.graph_pool_handle()
         for span in range(max_span, 0, -1):
             batch = Batch(reqs=[dummy_req], phase="decode")
             batch.padded_reqs = batch.reqs
