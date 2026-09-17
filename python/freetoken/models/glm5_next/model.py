@@ -347,6 +347,8 @@ class Glm5NextForCausalLM(BaseLLMModel):
         n = hidden.shape[0]
         if not self.mtp_layers.op_list or not batch.is_prefill or batch.size != 1 or n < 4:
             return
+        if getattr(batch, "speculative", False) or torch.cuda.is_current_stream_capturing():
+            return  # a verify block or a graph capture, not a prompt
         ids = input_ids.view(-1)
         next_ids = torch.cat([ids[1:], ids[-1:]])
         embeds = self.model.embed_tokens.forward(next_ids)
