@@ -496,8 +496,8 @@ class Glm5NextForCausalLM(BaseLLMModel):
             self._target_features = MTPTargetFeatures(output)
             if _MTP_PROBE:
                 self._probe_mtp(input_ids, output)
-            if getattr(batch, "speculative", False):
-                return self.full_logits(output)  # acceptance reads every verify row
+        if getattr(batch, "speculative", False):
+            return self.full_logits(output)  # acceptance reads every verify row
         return self.lm_head.forward(output)
 
 
