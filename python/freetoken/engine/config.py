@@ -102,6 +102,10 @@ class EngineConfig:
     speculative_dspark: bool = False
     # GLM-5.3-Flash only: serve the checkpoint's MTP layer for speculative decoding.
     speculative_mtp: bool = False
+    # Draft tokens per MTP verify: the MTP layer runs this many sequential steps per block.
+    speculative_mtp_steps: int = 3
+    # Narrower MTP blocks until the request emits </think> (reasoning accepts less); 0 = off.
+    speculative_mtp_thinking_steps: int = 0
     # Experimental, request-local DSpark circuit breaker. 0 disables it. Once at least
     # dspark_fallback_min_drafted proposals have been measured below this acceptance
     # rate, use ordinary target decode for dspark_fallback_steps steps, then probe the

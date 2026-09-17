@@ -176,6 +176,11 @@ class Glm5NextDSABackend(DSAAttnBackend):
         # exactly the ones a straddling group just consumed.
         qsa_store_rows(tail_k, plan.ring_rows, k)
         qsa_store_rows(tail_g, plan.ring_rows, gate)
+        journal = getattr(batch, "spec_journal", None)
+        if journal is not None:
+            # A verify's rejected rows also land in the ring; commit restores the ring
+            # and re-stores only the accepted rows from these.
+            journal.index.append((slot, k, gate))
 
     # ----- selection: pools -> token rows + tail ------------------------------------------
     def _expand_and_tail(

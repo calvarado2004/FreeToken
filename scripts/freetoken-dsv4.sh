@@ -45,6 +45,8 @@ KV_RESERVE_TOKENS="${KV_RESERVE_TOKENS:-}"
 SPECULATIVE_DSPARK="${SPECULATIVE_DSPARK:-1}"
 # SPECULATIVE_MTP=1 serves a GLM-5.3-Flash checkpoint's MTP layer (--speculative-mtp).
 SPECULATIVE_MTP="${SPECULATIVE_MTP:-0}"
+SPECULATIVE_MTP_STEPS="${SPECULATIVE_MTP_STEPS:-3}"
+SPECULATIVE_MTP_THINKING_STEPS="${SPECULATIVE_MTP_THINKING_STEPS:-0}"
 # Request-local circuit breaker: persistently weak drafts fall back to target-only decode.
 # 0.60/32/64 is the measured Lenovo A/B setting; DSPARK_FALLBACK_ACCEPTANCE=0 disables it.
 DSPARK_FALLBACK_ACCEPTANCE="${DSPARK_FALLBACK_ACCEPTANCE:-0.60}"
@@ -145,7 +147,7 @@ cmd_start() {
 
     local spec=()
     [ "$SPECULATIVE_DSPARK" = "1" ] && spec=(--speculative-dspark)
-    [ "$SPECULATIVE_MTP" = "1" ] && spec+=(--speculative-mtp)
+    [ "$SPECULATIVE_MTP" = "1" ] && spec+=(--speculative-mtp --speculative-mtp-steps "$SPECULATIVE_MTP_STEPS" --speculative-mtp-thinking-steps "$SPECULATIVE_MTP_THINKING_STEPS")
     local fallback=()
     if [ "$DSPARK_FALLBACK_ACCEPTANCE" != "0" ] && [ "$DSPARK_FALLBACK_ACCEPTANCE" != "0.0" ]; then
         fallback=(

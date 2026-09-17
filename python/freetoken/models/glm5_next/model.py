@@ -18,7 +18,9 @@ W8A16 fp8 at load; the ~1.2 GiB bf16 head is read every decode step).
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Tuple
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, List, NamedTuple, Tuple
 
 import torch
 from freetoken.core import get_global_ctx
@@ -195,6 +197,34 @@ class Glm5NextMTPLayer(BaseOP):
         return self.shared_head.forward(x)
 
 
+class MTPTargetFeatures(NamedTuple):
+    """The target forward's final hidden rows (a CUDA-graph output under replay)."""
+
+    hidden: torch.Tensor
+
+
+@dataclass
+class _DraftSeed:
+    """The MTP step already taken for a request's next block: its first proposal."""
+
+    uid: int
+    position: int          # the verify anchor position this seed belongs to
+    token: torch.Tensor    # [1] proposal for position + 1
+    probs: torch.Tensor    # [vocab] the distribution it was drawn from
+    hidden: torch.Tensor   # [1, hidden] MTP output that produced it (recycled by step 2)
+
+
+@dataclass
+class _SpecJournal:
+    """Per-verify state the commit needs once acceptance is known."""
+
+    start: int                          # anchor position
+    ring_k: torch.Tensor                # [index_layers, kpool, Di] tail rings before drafting
+    ring_gate: torch.Tensor
+    kda: list = field(default_factory=list)    # KDAVerifyRows, one per KDA layer
+    index: list = field(default_factory=list)  # (slot, k [rows, Di], gate [rows, Di])
+
+
 class Glm5NextModel(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         self.embed_tokens = VocabParallelEmbedding(
@@ -232,6 +262,11 @@ class Glm5NextForCausalLM(BaseLLMModel):
             [Glm5NextMTPLayer(config, lid, prefix=f"mtp_layers.{k}") for k, lid in enumerate(mtp_ids)]
         )
         self._last_hidden: torch.Tensor | None = None
+        self._target_features: MTPTargetFeatures | None = None
+        self._draft_seed: _DraftSeed | None = None
+        self._think_end_id: int | None = None
+        self._thinking_width: int | None = None
+        self._think_scan: tuple = (None, 0, False)
 
     def full_logits(self, h: torch.Tensor) -> torch.Tensor:
         """Full-vocabulary logits for EVERY row of ``h`` (ParallelLMHead.forward keeps one row per
@@ -275,6 +310,174 @@ class Glm5NextForCausalLM(BaseLLMModel):
         summary = ", ".join(f"{k} {100.0 * v / max(total, 1):.1f}%" for k, v in counts.items())
         logger.info_rank0(f"MTP probe over {total} positions: {summary}")
 
+    # ----- MTP speculative decoding --------------------------------------------------------
+    # Serving shape: one request (max_running_req == 1), like DSpark's adaptive path.
+    #
+    # Alignment (validated by _probe_mtp): the MTP row at position t is fed token t+1 and the
+    # target hidden at t, and predicts token t+2. So after the target has scored positions
+    # ..p and sampled token p+1, one MTP row at p yields the proposal for p+2 -- the first
+    # draft of a verify anchored at p+1. Later steps recycle the MTP hidden in place of the
+    # target's. The MTP layer's KV at a position is always rewritten from the TARGET hidden
+    # once that position is committed (catch-up), so draft-step KV never outlives a block.
+
+    def dspark_target_features(self) -> MTPTargetFeatures | None:
+        return self._target_features
+
+    def speculative_width(self, req, max_width: int) -> int:
+        """Narrow blocks while the request is still inside ``<think>`` (lower acceptance)."""
+        if self._thinking_width is None or self._think_end_id is None:
+            return max_width
+        uid, scanned, closed = self._think_scan
+        if uid != req.uid:
+            scanned, closed = req.max_device_len - req.output_len, False  # generated tokens only
+        if not closed:
+            ids = req.input_ids
+            closed = bool((ids[scanned:] == self._think_end_id).any())
+            scanned = ids.numel()
+        self._think_scan = (req.uid, scanned, closed)
+        return max_width if closed else min(max_width, self._thinking_width)
+
+    def configure_speculative_phases(self, think_end_id: int | None, thinking_width: int | None) -> None:
+        self._think_end_id = think_end_id
+        self._thinking_width = thinking_width
+        self._think_scan = (None, 0, False)
+
+    @contextmanager
+    def _rows(self, batch, start: int, lo: int, hi: int):
+        """Run the MTP layer over rows ``[lo, hi)`` of a single-request verify batch.
+
+        Those rows' positions (``start + lo``..) already own paged slots (allocated for the
+        whole block), so only the view changes: positions, out_loc and the request's
+        cached/device length, then attention metadata rebuilt for that range.
+        """
+        ctx = get_global_ctx()
+        req = batch.reqs[0]
+        saved = (batch.positions, batch.out_loc, batch.attn_metadata, req.cached_len, req.device_len)
+        batch.positions = saved[0][lo:hi]
+        batch.out_loc = saved[1][lo:hi]
+        req.cached_len, req.device_len = start + lo, start + hi
+        ctx.attn_backend.prepare_metadata(batch)
+        try:
+            yield
+        finally:
+            batch.positions, batch.out_loc, batch.attn_metadata = saved[:3]
+            req.cached_len, req.device_len = saved[3:]
+
+    def _propose(self, hidden: torch.Tensor, sp) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Draw one proposal from an MTP output row, shaped like the target's sampler."""
+        from freetoken.models.deepseek_v4.dspark import sampling_probs
+
+        probs = sampling_probs(self.full_logits(hidden), sp.temperature, sp.top_p, sp.top_k)
+        token = probs.argmax(dim=-1) if sp.is_greedy else torch.multinomial(probs, 1).squeeze(-1)
+        return token, probs[0]
+
+    def _mtp_rows(self, tokens: torch.Tensor, positions: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+        embeds = self.model.embed_tokens.forward(tokens)
+        return self.mtp_layers.op_list[0].forward(embeds, positions, hidden)
+
+    def _seed(self, req, position: int, row_hidden: torch.Tensor) -> None:
+        token, probs = self._propose(row_hidden, req.sampling_params)
+        self._draft_seed = _DraftSeed(req.uid, position, token, probs, row_hidden)
+
+    @torch.no_grad()
+    def commit_target_forward(self, batch, features: MTPTargetFeatures | None, next_tokens: torch.Tensor) -> None:
+        """After an ordinary prefill/decode: MTP KV over its rows, and the next block's seed."""
+        self._draft_seed = None
+        if not self.mtp_layers.op_list or features is None or len(batch.reqs) != 1:
+            return
+        if getattr(batch, "padded_size", 1) != 1 or batch.mm_embeds is not None:
+            return
+        req = batch.reqs[0]
+        n = batch.input_ids.numel() if batch.is_prefill else 1
+        hidden = features.hidden[:n]
+        # complete_one has run: cached_len is the position of the token after the last row.
+        nxt = req.cached_len
+        if req.input_ids.numel() > nxt:  # a chunked prompt continues
+            follow = req.input_ids[nxt : nxt + 1].to(batch.input_ids.device, non_blocking=True)
+        else:
+            follow = next_tokens[:1]
+        tokens = torch.cat([batch.input_ids[1:n].long(), follow.long().view(1)])
+        out = self._mtp_rows(tokens, batch.positions[:n], hidden)
+        if req.input_ids.numel() <= nxt:
+            self._seed(req, nxt, out[n - 1 : n])
+
+    @torch.no_grad()
+    def draft(self, sampling_params) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Propose ``spec_block`` tokens for the prepared verify batch (one request)."""
+        if not self.mtp_layers.op_list:
+            return None
+        ctx = get_global_ctx()
+        batch = ctx.batch
+        if len(batch.reqs) != 1:
+            raise RuntimeError("GLM MTP speculation serves one request per batch")
+        req = batch.reqs[0]
+        k = int(batch.spec_block)
+        start = req.cached_len
+        seed = self._draft_seed
+        if seed is None or seed.uid != req.uid or seed.position != start:
+            raise RuntimeError(
+                f"MTP has no seed for request {req.uid} at position {start} "
+                f"(have {None if seed is None else (seed.uid, seed.position)})"
+            )
+        kv = ctx.kv_cache
+        if not hasattr(kv, "_tail_k"):
+            raise RuntimeError("GLM MTP speculation needs the kpool DSA cache (FREETOKEN_GLM_DSA=1)")
+        journal = _SpecJournal(
+            start=start,
+            ring_k=kv._tail_k[:, req.table_idx].clone(),
+            ring_gate=kv._tail_gate[:, req.table_idx].clone(),
+        )
+        tokens, probs, hidden = [seed.token.view(1)], [seed.probs], seed.hidden
+        sp = sampling_params[0]
+        for j in range(1, k):
+            # Step j+1 sits at position start + j - 1 (row j - 1 of the verify block).
+            with self._rows(batch, start, j - 1, j):
+                hidden = self._mtp_rows(tokens[-1].long(), batch.positions, hidden)
+            token, q = self._propose(hidden, sp)
+            tokens.append(token.view(1))
+            probs.append(q)
+        proposed = torch.cat(tokens).long()
+        q = torch.stack(probs)
+        confidence = q.gather(1, proposed.view(-1, 1)).squeeze(1)
+        # Journal only the verify that follows; the draft steps above wrote nothing to keep.
+        batch.spec_journal = journal
+        return proposed, q, confidence
+
+    @torch.no_grad()
+    def commit_speculative(self, batch, accepted: List[int], emitted: List[torch.Tensor]) -> None:
+        """Roll per-token state back to the accepted prefix, then seed the next block."""
+        journal: _SpecJournal | None = getattr(batch, "spec_journal", None)
+        batch.spec_journal = None
+        self._draft_seed = None
+        if journal is None:
+            raise RuntimeError("an MTP verify finished without its journal")
+        ctx = get_global_ctx()
+        req = batch.reqs[0]
+        span = int(batch.spec_block) + 1
+        n = accepted[0]
+        for rows in journal.kda:
+            rows.layer.commit_verify(rows, accepted, span)
+
+        kv = ctx.kv_cache
+        r = req.table_idx
+        kv._tail_k[:, r].copy_(journal.ring_k)
+        kv._tail_gate[:, r].copy_(journal.ring_gate)
+        kp = kv._tail_k.shape[2]
+        lo = max(0, n + 1 - kp)
+        dev = batch.positions.device
+        keep_rows = torch.arange(lo, n + 1, device=dev)
+        residues = torch.tensor([(journal.start + i) % kp for i in range(lo, n + 1)], device=dev)
+        for slot, k_rows, gate_rows in journal.index:
+            kv.tail_k(slot)[r].index_copy_(0, residues, k_rows.index_select(0, keep_rows).to(kv._tail_k.dtype))
+            kv.tail_gate(slot)[r].index_copy_(0, residues, gate_rows.index_select(0, keep_rows).to(kv._tail_gate.dtype))
+
+        if self._last_hidden is None:
+            return
+        tokens = emitted[0].to(dev, non_blocking=True).long()  # accepted drafts + bonus
+        with self._rows(batch, journal.start, 0, n + 1):
+            out = self._mtp_rows(tokens, batch.positions, self._last_hidden[: n + 1])
+        self._seed(req, journal.start + n + 1, out[n : n + 1])
+
     def prepare_for_runtime(self) -> None:
         """Post-load, pre-KV-sizing hook: materialize the DSA layers' bmm-ready
         kv_b splits and free the checkpoint-layout originals (glm_moe_dsa
@@ -285,12 +488,16 @@ class Glm5NextForCausalLM(BaseLLMModel):
         torch.cuda.empty_cache()
 
     def forward(self) -> torch.Tensor:
-        input_ids = get_global_ctx().batch.input_ids
+        batch = get_global_ctx().batch
+        input_ids = batch.input_ids
         output = self.model.forward(input_ids)
         if self.mtp_layers.op_list:
             self._last_hidden = output
+            self._target_features = MTPTargetFeatures(output)
             if _MTP_PROBE:
                 self._probe_mtp(input_ids, output)
+            if getattr(batch, "speculative", False):
+                return self.full_logits(output)  # acceptance reads every verify row
         return self.lm_head.forward(output)
 
 

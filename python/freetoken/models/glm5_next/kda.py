@@ -23,7 +23,7 @@ free). Hybrid-radix track snapshots ride the per-chunk h (``return_h``).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 from freetoken.core import get_global_ctx
@@ -34,6 +34,25 @@ from freetoken.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+
+class KDAVerifyRows(NamedTuple):
+    """One KDA layer's inputs over a speculative verify, kept until acceptance is known.
+
+    The verify writes only the anchor row's recurrent state (the anchor is always kept);
+    commit replays the accepted draft rows on top of it and rebuilds the conv window from
+    the pre-verify ``window`` plus the accepted rows' raw conv inputs.
+    """
+
+    layer: "Glm5NextKDA"
+    live: torch.Tensor      # [N] int64 live state slot per request
+    window: torch.Tensor    # [N, conv_dim, kernel-1] conv state before the verify
+    conv_in: torch.Tensor   # [total, conv_dim] raw (pre-conv) inputs
+    q: torch.Tensor         # [1, total, H, D] post-conv
+    k: torch.Tensor
+    v: torch.Tensor
+    g: torch.Tensor         # [total, H*D] raw forget-gate logits
+    beta: torch.Tensor      # [total, H] raw beta logits
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -143,6 +162,8 @@ class Glm5NextKDA(BaseOP):
                 lower_bound=self.lower_bound,
                 scale=self.scale,
             )
+        elif getattr(batch, "spec_journal", None) is not None:
+            core_out = self._verify(conv_in, g1, b, pool, li, fla, batch.spec_journal)
         else:
             x = conv_in.transpose(0, 1).contiguous()  # [conv_dim, total]
             mixed = causal_conv1d_varlen(
@@ -190,6 +211,83 @@ class Glm5NextKDA(BaseOP):
         out = self.o_norm.forward(core_out, g2.reshape(-1, d)).reshape(total, -1)
         return self.o_proj.forward(out.to(dtype))
 
+    def _verify(self, conv_in, g1, b, pool, li, fla, journal) -> torch.Tensor:
+        """Speculative verify over equal ``1 + k`` spans per request.
+
+        Outputs every row exactly as decode would, but leaves the recurrent state at the
+        ANCHOR row: the kernel's 2-D state indices write row 0 into the live slot and skip
+        the draft rows (-1). The conv kernel refreshes the window to the end of the span,
+        so the pre-verify window is saved for the rollback in :meth:`commit_verify`.
+        """
+        h, d, p = self.num_heads, self.head_dim, self.proj_size
+        total = conv_in.shape[0]
+        live = fla.cache_indices.to(torch.int64)
+        n_req = live.numel()
+        span = total // n_req
+        assert span * n_req == total and span > 1, "a verify has equal spans of anchor + drafts"
+        window = pool.conv_states[li].index_select(0, live)
+        conv_raw = conv_in.clone()  # the varlen conv writes its output over its input
+        mixed = causal_conv1d_varlen(
+            conv_in.transpose(0, 1).contiguous(), self._conv_weight(), pool.conv_states[li],
+            fla.cu_seqlens, fla.cache_indices, fla.has_initial_state,
+        ).transpose(0, 1)
+        q, k, v = (
+            t.reshape(1, total, h, d).to(conv_in.dtype)
+            for t in torch.split(mixed, [p, p, p], dim=-1)
+        )
+        indices = torch.full((n_req, span), -1, dtype=torch.int32, device=conv_in.device)
+        indices[:, 0] = fla.cache_indices
+        core_out, _ = _fused_recurrent(
+            q, k, v,
+            g=g1.view(1, total, h, d),
+            beta=b.view(1, total, h),
+            state_pool=pool.recurrent_states[li],
+            indices=indices,
+            cu_seqlens=fla.cu_seqlens,
+            a_log=self.A_log,
+            dt_bias=self.dt_bias,
+            lower_bound=self.lower_bound,
+            scale=self.scale,
+        )
+        journal.kda.append(KDAVerifyRows(self, live, window, conv_raw, q, k, v, g1, b))
+        return core_out
+
+    def commit_verify(self, rows: KDAVerifyRows, accepted: list[int], span: int) -> None:
+        """Move each request's KDA state from the anchor row to its last accepted row."""
+        pool = get_global_ctx().linear_state_pool
+        li = pool.local_index(self.layer_id)
+        h, d = self.num_heads, self.head_dim
+        conv = pool.conv_states[li]
+        km1 = conv.shape[-1]
+        for i, n in enumerate(accepted):
+            base = i * span
+            slot = rows.live[i : i + 1]
+            if n + 1 < span:
+                seq = torch.cat(
+                    [rows.window[i], rows.conv_in[base : base + n + 1].transpose(0, 1).to(conv.dtype)],
+                    dim=-1,
+                )
+                conv.index_copy_(0, slot, seq[:, -km1:].unsqueeze(0))
+            if n == 0:
+                continue
+            lo, hi = base + 1, base + 1 + n
+            # Read the live slot at row 0 and write it back at the last row; -1 skips the rest.
+            indices = torch.full((1, n), -1, dtype=torch.int32, device=conv.device)
+            indices[0, 0] = slot[0]
+            indices[0, n - 1] = slot[0]
+            _fused_recurrent(
+                rows.q[:, lo:hi], rows.k[:, lo:hi], rows.v[:, lo:hi],
+                g=rows.g[lo:hi].reshape(1, n, h, d),
+                beta=rows.beta[lo:hi].reshape(1, n, h),
+                state_pool=pool.recurrent_states[li],
+                indices=indices,
+                cu_seqlens=torch.tensor([0, n], dtype=torch.int32, device=conv.device),
+                a_log=self.A_log,
+                dt_bias=self.dt_bias,
+                lower_bound=self.lower_bound,
+                scale=self.scale,
+            )
+
 
 def _fused_recurrent(
     q, k, v, g, beta, state_pool, indices, cu_seqlens,
@@ -214,4 +312,4 @@ def _fused_recurrent(
     )
 
 
-__all__ = ["Glm5NextKDA"]
+__all__ = ["Glm5NextKDA", "KDAVerifyRows"]

@@ -990,6 +990,9 @@ class Scheduler(SchedulerIOMixin):
         ):
             return
         gamma = spec.block_size
+        choose_width = getattr(getattr(self, "engine", None), "speculative_width", None)
+        if choose_width is not None:
+            gamma = min([gamma] + [int(choose_width(req, gamma)) for req in batch.reqs])
         if gamma < 1:
             return
         for req in batch.reqs:
@@ -1103,6 +1106,14 @@ def _speculative_config(config) -> "_SpeculativeConfig | None":
     dSpark's block width and noise token are properties of the checkpoint, and a run
     that used different ones would put the drafter off its training distribution.
     """
+    glm = getattr(config.model_config, "glm5_args", None)
+    if glm is not None and getattr(config, "speculative_mtp", False):
+        # GLM-5.3-Flash MTP drafts one token per step, so the block width is a serving
+        # choice rather than a checkpoint property. The placeholder id is never read: the
+        # drafter overwrites every proposal slot before the verify.
+        if not glm.mtp_layer_ids:
+            return None
+        return _SpeculativeConfig(block_size=int(config.speculative_mtp_steps), noise_token_id=0)
     args = getattr(config.model_config, "dsv4_args", None)
     if args is None or not getattr(args, "dspark_enabled", False):
         return None

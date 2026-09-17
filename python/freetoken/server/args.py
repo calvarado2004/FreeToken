@@ -327,6 +327,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--speculative-mtp-steps",
+        type=_positive_int,
+        default=ServerArgs.speculative_mtp_steps,
+        help="GLM-5.3-Flash MTP: draft tokens proposed (and verified) per speculative block.",
+    )
+
+    parser.add_argument(
+        "--speculative-mtp-thinking-steps",
+        type=int,
+        default=ServerArgs.speculative_mtp_thinking_steps,
+        help="GLM-5.3-Flash MTP: draft tokens per block while the request is still thinking (0: same as --speculative-mtp-steps).",
+    )
+
+    parser.add_argument(
         "--dspark-fallback-acceptance",
         type=_parse_moe_cache_rate,
         default=ServerArgs.dspark_fallback_acceptance,
