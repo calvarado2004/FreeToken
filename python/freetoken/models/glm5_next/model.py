@@ -56,6 +56,8 @@ _MTP_PROBE = os.environ.get("FREETOKEN_GLM_MTP_PROBE", "0") == "1"
 _MTP_PROBE_EXACT = os.environ.get("FREETOKEN_GLM_MTP_PROBE_EXACT", "0") == "1"
 # FREETOKEN_GLM_MTP_GRAPH_CHECK=N: compare the first N MTP graph replays against the eager layer.
 _MTP_GRAPH_CHECK = int(os.environ.get("FREETOKEN_GLM_MTP_GRAPH_CHECK", "0") or 0)
+# FREETOKEN_GLM_MTP_GRAPHS=0: run the MTP layer eagerly (no draft graphs).
+_MTP_GRAPHS = os.environ.get("FREETOKEN_GLM_MTP_GRAPHS", "1") != "0"
 
 
 class Glm5NextDecoderLayer(BaseOP):
@@ -471,7 +473,7 @@ class Glm5NextForCausalLM(BaseLLMModel):
 
         ctx = get_global_ctx()
         stage = getattr(ctx.attn_backend, "_stage_spec_verify", None)
-        if not self.mtp_layers.op_list or stage is None or max_span < 1:
+        if not self.mtp_layers.op_list or stage is None or max_span < 1 or not _MTP_GRAPHS:
             return
         dev = ctx.page_table.device
         hidden_size = self._config.hidden_size
