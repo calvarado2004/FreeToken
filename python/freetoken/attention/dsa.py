@@ -94,6 +94,9 @@ class DSAMetadata(BaseAttnMetadata):
     # _stage_decode, QSA ring_slots precedent); eager decode reads active_table_idx.
     ring_slots:     torch.Tensor | None = None
     kpool_plan:     "KpoolPlan | None" = None
+    # Whether kpool_plan was built inside a CUDA-graph capture. A capture reuses only a plan
+    # built by the same capture: the warmup's eager plan lives outside the graph pool.
+    kpool_plan_in_graph: bool = False
     # glm5_next speculative verify graph: the block's rows ride the decode path as one
     # query each, while the kpool store keeps them one request ([0, span], all row 0)
     # so a pool closing inside the block reads its in-block members from this forward.

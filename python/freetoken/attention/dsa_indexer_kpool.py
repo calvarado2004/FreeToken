@@ -173,7 +173,10 @@ class Glm5NextDSABackend(DSAAttnBackend):
         forwards: a capture batch runs its warmup and its capture through ONE
         metadata object, and a cached plan would bake the warmup's (non-graph-pool)
         tensor addresses into the graph (QSA precedent)."""
-        if slot != 0 and md.kpool_plan is not None:
+        capturing = torch.cuda.is_current_stream_capturing()
+        # Slot 0 is not always in the forward: the MTP layer's graphs hold only its own slot,
+        # so reusing the warmup's plan would bake freed eager tensors into the capture.
+        if slot != 0 and md.kpool_plan is not None and md.kpool_plan_in_graph == capturing:
             return md.kpool_plan
         kp = self.kpool
         out_loc = batch.out_loc.to(torch.int64)
@@ -221,6 +224,7 @@ class Glm5NextDSABackend(DSAAttnBackend):
             torch.int32
         )
         md.kpool_plan = KpoolPlan(cmp_rows, ring_rows, ring_slots, token_to_req, cu_seqlens)
+        md.kpool_plan_in_graph = capturing
         return md.kpool_plan
 
     def _store_index(self, inputs, batch: "Batch", layer_id: int) -> None:
