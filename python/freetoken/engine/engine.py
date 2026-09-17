@@ -1259,10 +1259,12 @@ class Engine:
                 self.config.dspark_fallback_min_drafted,
                 self.config.dspark_fallback_steps,
             )
-        if not curve or block_size < 1 or self.config.speculative_mtp:
-            # MTP drafts sequentially and has no confidence head to price widths with, so
-            # it keeps the fixed width (phase-narrowed) plus the acceptance fallback.
+        if not curve or block_size < 1:
             return
+        if self.config.speculative_mtp:
+            # The profiled scheduler carries its own acceptance fallback; MTP prices widths
+            # with each proposal's draft probability in place of a confidence head.
+            self._mtp_fallback = None
         if self.config.max_running_req != 1:
             logger.warning_rank0(
                 "DSpark adaptive verification needs the paper's marker-tensor varlen "
@@ -1378,6 +1380,12 @@ class Engine:
 
         base = req.input_ids.numel() - max_width
         span = width + 1
+        if getattr(batch.attn_metadata, "segments", None) is None and not (
+            self.graph_runner.can_use_spec_cuda_graph_span(batch, span)
+        ):
+            # Segment-free backends (GLM) restage their verify metadata from the trimmed
+            # rows at graph replay; without that graph there is no metadata to shrink.
+            return
         req.input_ids = req._ids_buf[: base + width]
         batch.input_ids = batch.input_ids[:span]
         batch.positions = batch.positions[:span]
@@ -1389,10 +1397,11 @@ class Engine:
         batch.draft_probs = batch.draft_probs[:width]
         batch.draft_confidence = confidence[:width]
         segments = getattr(batch.attn_metadata, "segments", None)
-        if segments is None or len(segments) != 1:
-            raise RuntimeError("adaptive DSpark needs one target metadata segment")
-        _off, _old_n, table_idx, start_pos = segments[0]
-        batch.attn_metadata.segments = [(0, span, table_idx, start_pos)]
+        if segments is not None:
+            if len(segments) != 1:
+                raise RuntimeError("adaptive DSpark needs one target metadata segment")
+            _off, _old_n, table_idx, start_pos = segments[0]
+            batch.attn_metadata.segments = [(0, span, table_idx, start_pos)]
         batch.spec_block = width
 
     def _record_adaptive_draft_cost(self, batch: Batch) -> None:

@@ -451,6 +451,9 @@ class GraphRunner:
             and batch.padded_size == batch.size
         )
 
+    def can_use_spec_cuda_graph_span(self, batch: Batch, span: int) -> bool:
+        return (batch.padded_size, span) in self.spec_graph_map and batch.padded_size == batch.size
+
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
