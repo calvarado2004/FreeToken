@@ -1,0 +1,74 @@
+# FreeToken GLM-5.3-Flash NVFP4 TP4 with MTP speculative decoding (4x RTX A4000), for testing.
+#
+# Same serving setup as freetoken-glm53.service plus the checkpoint's MTP layer as the drafter:
+# up to 4 draft tokens per block, the verify width chosen per block from the drafts' confidence,
+# the verify and the MTP draft steps replayed as CUDA graphs. It runs the wip/glm53-mtp checkout at
+# /home/carlos/FreeToken-glm-mtp (Python sources and kernels) with the main checkout's venv.
+#
+# Install without enabling it -- the toggle switcher owns which inference unit runs:
+#   sudo install -m 0644 deploy/systemd/freetoken-glm53-mtp.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#
+# Knobs (systemctl edit freetoken-glm53-mtp): SPECULATIVE_MTP_STEPS (max drafts per block),
+# DSPARK_FALLBACK_ACCEPTANCE (e.g. 0.60: fall back to plain decode while acceptance stays below it),
+# FREETOKEN_GLM_MTP_GRAPHS=0 (eager MTP draft steps), FREETOKEN_SPEC_TIMING=1 (per-block timing log).
+
+[Unit]
+Description=FreeToken GLM-5.3-Flash NVFP4 TP4 + MTP (4x RTX A4000)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/home/carlos/FreeToken-glm-mtp/scripts/freetoken-glm53.sh
+ConditionPathExists=/home/carlos/FreeToken/.venv/bin/ft
+ConditionPathExists=/home/carlos/models/GLM-5.3-Flash-NVFP4/config.json
+ConditionPathExists=/etc/ssl/levelg.io/fullchain.pem
+ConditionPathExists=/etc/ssl/levelg.io/privkey.pem
+
+[Service]
+Type=forking
+User=carlos
+Group=carlos
+WorkingDirectory=/home/carlos/FreeToken
+PIDFile=/tmp/freetoken-glm53-mtp.pid
+
+Environment="HOME=/home/carlos"
+Environment="FT_DIR=/home/carlos/FreeToken"
+Environment="PYTHONPATH=/home/carlos/FreeToken-glm-mtp/python"
+Environment="MODEL=/home/carlos/models/GLM-5.3-Flash-NVFP4"
+Environment="MODEL_LABEL=GLM-5.3-Flash NVFP4 + MTP"
+Environment="LOG=/tmp/freetoken-glm53-mtp.log"
+Environment="PIDFILE=/tmp/freetoken-glm53-mtp.pid"
+Environment="HF_HOME=/home/carlos/.cache/huggingface"
+Environment="SSL_CERTFILE=/etc/ssl/levelg.io/fullchain.pem"
+Environment="SSL_KEYFILE=/etc/ssl/levelg.io/privkey.pem"
+Environment="TLS_SERVER_NAME=lenovo-thinkstation.levelg.io"
+Environment="CUDA_DEVICE_ORDER=PCI_BUS_ID"
+Environment="CC=/usr/bin/gcc-15"
+Environment="CXX=/usr/bin/g++-15"
+Environment="CUDAHOSTCXX=/usr/bin/g++-15"
+
+Environment="MEMORY_RATIO=0.80"
+Environment="TP_SIZE=4"
+Environment="MAX_RUNNING_REQUESTS=1"
+Environment="MAX_PREFILL_LENGTH=2048"
+Environment="EXPERT_LOAD=serial"
+Environment="KV_RESERVE_TOKENS=131072"
+Environment="SPECULATIVE_MTP=1"
+Environment="SPECULATIVE_MTP_STEPS=4"
+Environment="FREETOKEN_LOG_TO_STDOUT=1"
+
+ExecStart=/usr/bin/bash /home/carlos/FreeToken-glm-mtp/scripts/freetoken-glm53.sh start
+ExecStop=/usr/bin/bash /home/carlos/FreeToken-glm-mtp/scripts/freetoken-glm53.sh kill
+ExecStopPost=-/usr/bin/bash /home/carlos/FreeToken-glm-mtp/scripts/freetoken-glm53.sh kill
+
+TimeoutStartSec=3000
+TimeoutStopSec=30
+KillMode=control-group
+SendSIGKILL=yes
+Restart=on-failure
+RestartSec=10
+SuccessExitStatus=SIGKILL 137
+OOMScoreAdjust=-900
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

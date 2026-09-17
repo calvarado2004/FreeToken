@@ -12,9 +12,10 @@ export MODEL="${MODEL:-$HOME/models/GLM-5.3-Flash-NVFP4}"
 export MODEL_LABEL="${MODEL_LABEL:-GLM-5.3-Flash NVFP4}"
 export LOG="${LOG:-/tmp/freetoken-glm53.log}"
 export PIDFILE="${PIDFILE:-/tmp/freetoken-glm53.pid}"
-# No dSpark drafter for GLM; the fallback flags belong to it.
+# No dSpark drafter for GLM. SPECULATIVE_MTP=1 serves the checkpoint's MTP layer instead, and the
+# acceptance fallback (off unless set) applies to it.
 export SPECULATIVE_DSPARK=0
-export DSPARK_FALLBACK_ACCEPTANCE=0
+export DSPARK_FALLBACK_ACCEPTANCE="${DSPARK_FALLBACK_ACCEPTANCE:-0}"
 # MLA keeps one 512-wide latent per token, so a large KV floor costs little VRAM next to experts.
 export KV_RESERVE_TOKENS="${KV_RESERVE_TOKENS:-131072}"
 # Z.ai's recommended sampling (model card); the checkpoint's generation_config.json only
