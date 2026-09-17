@@ -377,8 +377,8 @@ class Glm5NextForCausalLM(BaseLLMModel):
         if exact_h is not None:
             expected["E[accept] exact"] = 0.0
         total = 0
-        for lo in range(1, n - 3, 512):
-            hi = min(lo + 512, n - 3)
+        for lo in range(1, n - 3, 64):  # full-vocab probability sorts: keep chunks small
+            hi = min(lo + 64, n - 3)
             draft_logits = self.full_logits(mtp_h[lo:hi])
             draft = draft_logits.argmax(-1)
             target_logits = self.full_logits(hidden[lo - 1:hi + 2])  # rows lo-1 .. hi+1
