@@ -490,6 +490,7 @@ class Engine:
         if config.speculative_mtp and configure_phases is not None:
             thinking = config.speculative_mtp_thinking_steps or None
             configure_phases(_added_token_id(config.model_path, "</think>"), thinking)
+            self.model._model_path = config.model_path  # the MTP probe's FP8 reference reads it
             # The graph runner captures one verify graph per anchor + prefix width.
             self.model.speculative_verify_block_size = int(config.speculative_mtp_steps)
         if config.active_encoders:

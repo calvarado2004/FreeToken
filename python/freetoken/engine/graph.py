@@ -422,6 +422,10 @@ class GraphRunner:
                         cost_ms = self._profile_graph_ms(graph)
                         self.spec_verify_cost_curve.append((span, cost_ms))
 
+            capture_draft = getattr(model, "capture_draft_graphs", None)
+            if capture_draft is not None:
+                capture_draft(self.stream, pool, self.dummy_req, self.spec_span, self._reset_moe_offload_cache)
+
             if self.spec_verify_cost_curve:
                 # vLLM makes profiled costs nondecreasing before scheduling. Sampling
                 # noise must not make a wider target batch appear artificially cheaper.

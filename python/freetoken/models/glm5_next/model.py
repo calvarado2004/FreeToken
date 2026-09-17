@@ -51,6 +51,11 @@ logger = init_logger(__name__)
 # FREETOKEN_GLM_MTP_PROBE=1: on single-request prefills, log how often the MTP layer's
 # next-next-token argmax agrees with the target's (an offline acceptance estimate).
 _MTP_PROBE = os.environ.get("FREETOKEN_GLM_MTP_PROBE", "0") == "1"
+# FREETOKEN_GLM_MTP_PROBE_EXACT=1 (with the probe): also run the MTP layer with its routed experts
+# dequantized from the checkpoint's block FP8, to price the NVFP4 re-quantization.
+_MTP_PROBE_EXACT = os.environ.get("FREETOKEN_GLM_MTP_PROBE_EXACT", "0") == "1"
+# FREETOKEN_GLM_MTP_GRAPH_CHECK=N: compare the first N MTP graph replays against the eager layer.
+_MTP_GRAPH_CHECK = int(os.environ.get("FREETOKEN_GLM_MTP_GRAPH_CHECK", "0") or 0)
 
 
 class Glm5NextDecoderLayer(BaseOP):
@@ -185,7 +190,9 @@ class Glm5NextMTPLayer(BaseOP):
         self.shared_head = _SharedHead(hidden, eps)
 
     @nvtx_annotate("MTP")
-    def forward(self, embeds: torch.Tensor, positions: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, embeds: torch.Tensor, positions: torch.Tensor, prev_hidden: torch.Tensor, moe=None,
+    ) -> torch.Tensor:
         embeds = embeds.masked_fill((positions == 0).view(-1, 1), 0.0)
         x = self.eh_proj.forward(
             torch.cat([self.enorm.forward(embeds), self.hnorm.forward(prev_hidden)], dim=-1)
@@ -193,8 +200,54 @@ class Glm5NextMTPLayer(BaseOP):
         residual = x
         x = residual + self.self_attn.forward(self.input_layernorm.forward(x))
         residual = x
-        x = residual + self.mlp.forward(self.post_attention_layernorm.forward(x))
+        x = residual + (moe or self.mlp.forward)(self.post_attention_layernorm.forward(x))
         return self.shared_head.forward(x)
+
+
+class _ExactMTPExperts:
+    """The MTP layer's MoE with routed experts dequantized from the checkpoint's block FP8
+    (this rank's shard, bf16, one expert at a time) -- a reference for the served NVFP4 banks."""
+
+    def __init__(self, model_path: str, layer_id: int):
+        import json
+
+        from freetoken.models.glm5_next.weight import _CKPT, _ShardReader
+        from freetoken.utils import download_hf_weight
+
+        folder = download_hf_weight(model_path)
+        with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+            weight_map = json.load(f)["weight_map"]
+        self._reader = _ShardReader(folder, weight_map, torch.device("cpu"))
+        self._prefix = f"{_CKPT}.layers.{layer_id}.mlp.experts"
+
+    def _weight(self, e: int, proj: str, device) -> torch.Tensor:
+        from freetoken.distributed import get_tp_info
+        from freetoken.models.glm5_next.weight import _dequant_fp8_block
+
+        src = f"{self._prefix}.{e}.{proj}"
+        w = _dequant_fp8_block(self._reader.get(f"{src}.weight").to(device), self._reader.get(f"{src}.weight_scale").to(device))
+        tp = get_tp_info()
+        axis = 1 if proj == "down_proj" else 0
+        step = w.shape[axis] // tp.size
+        return w.narrow(axis, tp.rank * step, step).to(torch.bfloat16)
+
+    @torch.no_grad()
+    def __call__(self, block: Glm5NextSparseBlock, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.layers import swiglu_clamp_and_mul
+
+        weights, ids = block._route(x)
+        shared = block.shared_experts.forward(x)
+        experts = block.experts
+        out = torch.zeros_like(x)
+        for e in ids.unique().tolist():
+            rows, slot = (ids == e).nonzero(as_tuple=True)
+            xe = x[rows]
+            gate = xe @ self._weight(e, "gate_proj", x.device).T
+            up = xe @ self._weight(e, "up_proj", x.device).T
+            h = swiglu_clamp_and_mul(torch.cat([gate, up], dim=-1), alpha=float(experts.alpha), limit=float(experts.limit))
+            y = h @ self._weight(e, "down_proj", x.device).T
+            out.index_add_(0, rows, y * weights[rows, slot].unsqueeze(-1).to(y.dtype))
+        return experts._maybe_all_reduce(out) + shared
 
 
 class MTPTargetFeatures(NamedTuple):
@@ -270,6 +323,10 @@ class Glm5NextForCausalLM(BaseLLMModel):
         # Verify-graph journals by span: a replay runs no Python, so the rows the capture
         # recorded (graph-owned tensors, rewritten by every replay) are what commit reads.
         self._graph_journals: dict[int, _SpecJournal] = {}
+        # MTP layer graphs by row count (draft steps, catch-ups), sharing the verify staging.
+        self._mtp_graphs: dict[int, tuple] = {}
+        self._mtp_buf: dict[str, torch.Tensor] | None = None
+        self._mtp_check_left = _MTP_GRAPH_CHECK
 
     def full_logits(self, h: torch.Tensor) -> torch.Tensor:
         """Full-vocabulary logits for EVERY row of ``h`` (ParallelLMHead.forward keeps one row per
@@ -293,16 +350,43 @@ class Glm5NextForCausalLM(BaseLLMModel):
         ids = input_ids.view(-1)
         next_ids = torch.cat([ids[1:], ids[-1:]])
         embeds = self.model.embed_tokens.forward(next_ids)
-        mtp_h = self.mtp_layers.op_list[0].forward(embeds, batch.positions.view(-1), hidden)
+        mtp = self.mtp_layers.op_list[0]
+        mtp_h = mtp.forward(embeds, batch.positions.view(-1), hidden)
+        exact_h = None
+        if _MTP_PROBE_EXACT:
+            if getattr(self, "_exact_experts", None) is None:
+                self._exact_experts = _ExactMTPExperts(self._model_path, mtp._layer_id)
+            exact_h = mtp.forward(
+                embeds, batch.positions.view(-1), hidden, moe=lambda x: self._exact_experts(mtp.mlp, x)
+            )
         # MTP row t sees token t+1 and the target hidden at t, so it should predict token t+2: the
         # target's own argmax at t+1 and the prompt's token t+2. The t / t+2 columns catch an
         # off-by-one; the target-vs-truth column says how predictable the text itself is.
+        from freetoken.models.deepseek_v4.dspark import sampling_probs
+
         counts = {"target@t+1": 0, "target@t": 0, "target@t+2": 0, "truth@t+2": 0, "target_vs_truth": 0}
+        if exact_h is not None:
+            counts.update({"exact@t+1": 0, "exact_vs_nvfp4": 0})
+        # Expected per-token acceptance of standard speculative sampling, sum_x min(p, q), at the
+        # recommended sampling (temperature 1.0, top_p 0.95).
+        expected = {"E[accept] nvfp4": 0.0}
+        if exact_h is not None:
+            expected["E[accept] exact"] = 0.0
         total = 0
         for lo in range(1, n - 3, 512):
             hi = min(lo + 512, n - 3)
-            draft = self.full_logits(mtp_h[lo:hi]).argmax(-1)
-            target = self.full_logits(hidden[lo - 1:hi + 2]).argmax(-1)  # rows lo-1 .. hi+1
+            draft_logits = self.full_logits(mtp_h[lo:hi])
+            draft = draft_logits.argmax(-1)
+            target_logits = self.full_logits(hidden[lo - 1:hi + 2])  # rows lo-1 .. hi+1
+            target = target_logits.argmax(-1)
+            p = sampling_probs(target_logits[2:hi - lo + 2], 1.0, 0.95)
+            expected["E[accept] nvfp4"] += float(torch.minimum(p, sampling_probs(draft_logits, 1.0, 0.95)).sum())
+            if exact_h is not None:
+                exact_logits = self.full_logits(exact_h[lo:hi])
+                exact = exact_logits.argmax(-1)
+                counts["exact@t+1"] += int((exact == target[2:hi - lo + 2]).sum())
+                counts["exact_vs_nvfp4"] += int((exact == draft).sum())
+                expected["E[accept] exact"] += float(torch.minimum(p, sampling_probs(exact_logits, 1.0, 0.95)).sum())
             t0 = target[1:hi - lo + 1]
             counts["target@t"] += int((draft == t0).sum())
             counts["target@t+1"] += int((draft == target[2:hi - lo + 2]).sum())
@@ -310,7 +394,7 @@ class Glm5NextForCausalLM(BaseLLMModel):
             counts["truth@t+2"] += int((draft == ids[lo + 2:hi + 2]).sum())
             counts["target_vs_truth"] += int((target[2:hi - lo + 2] == ids[lo + 2:hi + 2]).sum())
             total += hi - lo
-        summary = ", ".join(f"{k} {100.0 * v / max(total, 1):.1f}%" for k, v in counts.items())
+        summary = ", ".join(f"{k} {100.0 * v / max(total, 1):.1f}%" for k, v in {**counts, **expected}.items())
         logger.info_rank0(f"MTP probe over {total} positions: {summary}")
 
     # ----- MTP speculative decoding --------------------------------------------------------
@@ -366,11 +450,11 @@ class Glm5NextForCausalLM(BaseLLMModel):
             batch.positions, batch.out_loc, batch.attn_metadata = saved[:3]
             req.cached_len, req.device_len = saved[3:]
 
-    def _propose(self, hidden: torch.Tensor, sp) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Draw one proposal from an MTP output row, shaped like the target's sampler."""
+    def _propose(self, logits: torch.Tensor, sp) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Draw one proposal from an MTP logits row, shaped like the target's sampler."""
         from freetoken.models.deepseek_v4.dspark import sampling_probs
 
-        probs = sampling_probs(self.full_logits(hidden), sp.temperature, sp.top_p, sp.top_k)
+        probs = sampling_probs(logits, sp.temperature, sp.top_p, sp.top_k)
         token = probs.argmax(dim=-1) if sp.is_greedy else torch.multinomial(probs, 1).squeeze(-1)
         return token, probs[0]
 
@@ -378,9 +462,81 @@ class Glm5NextForCausalLM(BaseLLMModel):
         embeds = self.model.embed_tokens.forward(tokens)
         return self.mtp_layers.op_list[0].forward(embeds, positions, hidden)
 
-    def _seed(self, req, position: int, row_hidden: torch.Tensor) -> None:
-        token, probs = self._propose(row_hidden, req.sampling_params)
-        self._draft_seed = _DraftSeed(req.uid, position, token, probs, row_hidden)
+    @torch.no_grad()
+    def capture_draft_graphs(self, stream, pool, dummy_req, max_span: int, reset_moe) -> None:
+        """Capture the MTP layer (+ last-row logits) for 1 .. ``max_span`` rows of one request."""
+        from freetoken.core import Batch
+
+        ctx = get_global_ctx()
+        stage = getattr(ctx.attn_backend, "_stage_spec_verify", None)
+        if not self.mtp_layers.op_list or stage is None or max_span < 1:
+            return
+        dev = ctx.page_table.device
+        hidden_size = self._config.hidden_size
+        buf = self._mtp_buf = {
+            "tokens": torch.zeros(max_span, dtype=torch.int64, device=dev),
+            "positions": torch.zeros(max_span, dtype=torch.int32, device=dev),
+            "out_loc": torch.zeros(max_span, dtype=torch.int32, device=dev),
+            "hidden": torch.zeros(max_span, hidden_size, dtype=torch.bfloat16, device=dev),
+        }
+        slot = dummy_req.linear_slot_idx if dummy_req.linear_slot_idx is not None else dummy_req.table_idx
+        for span in range(max_span, 0, -1):
+            batch = Batch(reqs=[dummy_req], phase="decode")
+            batch.padded_reqs = batch.reqs
+            batch.input_ids = buf["tokens"][:span]
+            batch.positions = buf["positions"][:span]
+            batch.out_loc = buf["out_loc"][:span]
+            buf["positions"][:span].copy_(torch.arange(span, dtype=torch.int32, device=dev))
+            stage(batch, dummy_req.table_idx, slot, 0)
+            graph = torch.cuda.CUDAGraph()
+            with ctx.forward_batch(batch):
+                self._mtp_rows(buf["tokens"][:span], buf["positions"][:span], buf["hidden"][:span])
+                with torch.cuda.graph(graph, pool=pool, stream=stream):
+                    out = self._mtp_rows(buf["tokens"][:span], buf["positions"][:span], buf["hidden"][:span])
+                    logits = self.full_logits(out[span - 1 : span])
+                reset_moe()
+            self._mtp_graphs[span] = (graph, out, logits)
+        logger.info_rank0(f"Captured MTP draft graphs for 1..{max_span} rows")
+
+    def _mtp_run(self, batch, start: int, lo: int, hi: int, tokens: torch.Tensor, hidden: torch.Tensor):
+        """MTP output rows and last-row logits for positions ``start+lo .. start+hi-1`` of the
+        batch's one request: a captured graph when one fits, else the eager layer."""
+        span = hi - lo
+        entry = self._mtp_graphs.get(span)
+        if entry is None:
+            if batch.is_decode and lo == 0 and hi == batch.positions.numel():
+                out = self._mtp_rows(tokens, batch.positions[lo:hi], hidden)
+            else:
+                with self._rows(batch, start, lo, hi):
+                    out = self._mtp_rows(tokens, batch.positions, hidden)
+            return out, self.full_logits(out[span - 1 : span])
+        graph, out, logits = entry
+        buf = self._mtp_buf
+        req = batch.reqs[0]
+        buf["tokens"][:span].copy_(tokens)
+        buf["positions"][:span].copy_(batch.positions[lo:hi])
+        buf["out_loc"][:span].copy_(batch.out_loc[lo:hi])
+        buf["hidden"][:span].copy_(hidden)
+        backend = get_global_ctx().attn_backend
+        saved = (batch.input_ids, batch.attn_metadata, batch.fla_metadata)
+        batch.input_ids = buf["tokens"][:span]
+        slot = req.linear_slot_idx if getattr(req, "linear_slot_idx", None) is not None else req.table_idx
+        try:
+            backend._stage_spec_verify(batch, req.table_idx, slot, start + lo)
+            graph.replay()
+        finally:
+            batch.input_ids, batch.attn_metadata, batch.fla_metadata = saved
+        if self._mtp_check_left > 0:
+            self._mtp_check_left -= 1
+            with self._rows(batch, start, lo, hi):
+                ref = self._mtp_rows(tokens, batch.positions, hidden)
+            err = (ref.float() - out[:span].float()).abs().max().item() / (ref.float().abs().max().item() + 1e-8)
+            logger.info_rank0(f"MTP graph check: span={span} start={start + lo} rel_err={err:.2e}")
+        return out[:span], logits
+
+    def _seed(self, req, position: int, row_hidden: torch.Tensor, logits: torch.Tensor) -> None:
+        token, probs = self._propose(logits, req.sampling_params)
+        self._draft_seed = _DraftSeed(req.uid, position, token, probs, row_hidden.clone())
 
     @torch.no_grad()
     def commit_target_forward(self, batch, features: MTPTargetFeatures | None, next_tokens: torch.Tensor) -> None:
@@ -400,9 +556,13 @@ class Glm5NextForCausalLM(BaseLLMModel):
         else:
             follow = next_tokens[:1]
         tokens = torch.cat([batch.input_ids[1:n].long(), follow.long().view(1)])
-        out = self._mtp_rows(tokens, batch.positions[:n], hidden)
+        if batch.is_prefill:
+            out = self._mtp_rows(tokens, batch.positions[:n], hidden)
+            logits = self.full_logits(out[n - 1 : n]) if req.input_ids.numel() <= nxt else None
+        else:
+            out, logits = self._mtp_run(batch, nxt - 1, 0, 1, tokens, hidden)
         if req.input_ids.numel() <= nxt:
-            self._seed(req, nxt, out[n - 1 : n])
+            self._seed(req, nxt, out[n - 1 : n], logits)
 
     @torch.no_grad()
     def draft(self, sampling_params) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
@@ -434,9 +594,8 @@ class Glm5NextForCausalLM(BaseLLMModel):
         sp = sampling_params[0]
         for j in range(1, k):
             # Step j+1 sits at position start + j - 1 (row j - 1 of the verify block).
-            with self._rows(batch, start, j - 1, j):
-                hidden = self._mtp_rows(tokens[-1].long(), batch.positions, hidden)
-            token, q = self._propose(hidden, sp)
+            hidden, logits = self._mtp_run(batch, start, j - 1, j, tokens[-1].long(), hidden)
+            token, q = self._propose(logits, sp)
             tokens.append(token.view(1))
             probs.append(q)
         proposed = torch.cat(tokens).long()
@@ -485,9 +644,8 @@ class Glm5NextForCausalLM(BaseLLMModel):
         if hidden is None or not self.mtp_layers.op_list:
             return
         tokens = emitted[0].to(dev, non_blocking=True).long()  # accepted drafts + bonus
-        with self._rows(batch, journal.start, 0, n + 1):
-            out = self._mtp_rows(tokens, batch.positions, hidden[: n + 1])
-        self._seed(req, journal.start + n + 1, out[n : n + 1])
+        out, logits = self._mtp_run(batch, journal.start, 0, n + 1, tokens, hidden[: n + 1])
+        self._seed(req, journal.start + n + 1, out[n : n + 1], logits)
 
     def prepare_for_runtime(self) -> None:
         """Post-load, pre-KV-sizing hook: materialize the DSA layers' bmm-ready
