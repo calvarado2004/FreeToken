@@ -45,6 +45,11 @@ class UserReply(BaseFrontendMsg):
     swa_total_tokens: int = 0
     # Bytes the engine process holds on the GPU (torch reserved pool). 0 when not reported.
     gpu_mem_bytes: int = 0
+    # Cumulative speculative-decoding counters (0/None when not reported).
+    spec_accepted_total: int = 0
+    spec_drafted_total: int = 0
+    spec_blocks_total: int = 0
+    spec_accepted_per_pos: list[int] | None = None
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would

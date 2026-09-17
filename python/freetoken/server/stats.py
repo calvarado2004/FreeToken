@@ -37,6 +37,11 @@ class StatsTracker:
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
         self.vram_bytes = 0
+        # Speculative decoding (last-known cumulative engine counters).
+        self.spec_accepted_total = 0
+        self.spec_drafted_total = 0
+        self.spec_blocks_total = 0
+        self.spec_accepted_per_pos: list[int] = []
 
     @property
     def active(self) -> int:
@@ -74,6 +79,11 @@ class StatsTracker:
             self.swa_total_tokens = reply.swa_total_tokens
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
+        if getattr(reply, "spec_blocks_total", 0) > self.spec_blocks_total:
+            self.spec_accepted_total = reply.spec_accepted_total
+            self.spec_drafted_total = reply.spec_drafted_total
+            self.spec_blocks_total = reply.spec_blocks_total
+            self.spec_accepted_per_pos = list(reply.spec_accepted_per_pos or [])
         if getattr(reply, "finished", False):
             uid = getattr(reply, "uid", None)
             if uid in self._inflight:
@@ -174,4 +184,14 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
             "prompt_tokens_total": tr.prompt_tokens_total,
             "completion_tokens_total": tr.completion_tokens_total,
         },
+        # Cumulative since the engine started; None until a speculative block ran.
+        "speculative": (
+            {
+                "accepted_tokens": tr.spec_accepted_total,
+                "drafted_tokens": tr.spec_drafted_total,
+                "blocks": tr.spec_blocks_total,
+                "accepted_per_position": tr.spec_accepted_per_pos,
+            }
+            if tr.spec_blocks_total > 0 else None
+        ),
     }

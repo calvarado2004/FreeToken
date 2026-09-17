@@ -494,6 +494,15 @@ class Scheduler(SchedulerIOMixin):
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
         )
+        totals = getattr(self.status_reporter, "spec_totals", None)
+        if reply and totals is not None:
+            accepted, drafted, blocks, per_pos = totals
+            if blocks:
+                for m in reply:
+                    m.spec_accepted_total = accepted
+                    m.spec_drafted_total = drafted
+                    m.spec_blocks_total = blocks
+                    m.spec_accepted_per_pos = per_pos
         self.send_result(reply)
 
     def _match_stop_str(self, req: Req, end_len: int | None = None) -> str | None:
