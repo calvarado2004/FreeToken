@@ -1374,6 +1374,11 @@ class Engine:
             )
         req = batch.reqs[0]
         width = manager.record_and_choose(confidence, req.uid)
+        if os.environ.get("FREETOKEN_GLM_MTP_RANK_CHECK", "0") == "1" and get_tp_info().size > 1:
+            gathered = [None] * get_tp_info().size
+            torch.distributed.all_gather_object(gathered, (req.cached_len, width))
+            if any(g != gathered[0] for g in gathered):
+                raise RuntimeError(f"TP ranks chose different verify widths: {gathered}")
         if width == max_width:
             return
         if not 0 <= width < max_width:
