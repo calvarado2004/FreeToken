@@ -54,6 +54,11 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    # Cumulative speculative-decoding counters of this engine (0 when not speculating).
+    spec_accepted_total: int = 0
+    spec_drafted_total: int = 0
+    spec_blocks_total: int = 0
+    spec_accepted_per_pos: list[int] | None = None
 
 
 @dataclass

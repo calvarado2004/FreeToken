@@ -21,12 +21,20 @@ class SchedulerStatusReporter:
     # drafter from a cheap one that is always rejected.
     _spec_accepted: int = field(default=0, init=False)
     _spec_drafted: int = field(default=0, init=False)
+    _spec_blocks: int = field(default=0, init=False)
+    # accepted drafts by position in the block: index i counts blocks that kept draft i
+    _spec_accepted_per_pos: list = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
         self._last_prefill_time = now
         self._last_decode_time = now
         self.decode_log_interval = max(1, self.decode_log_interval)
+
+    @property
+    def spec_totals(self) -> tuple[int, int, int, list[int]]:
+        """Cumulative (accepted drafts, verified drafts, blocks, accepted per position)."""
+        return self._spec_accepted, self._spec_drafted, self._spec_blocks, list(self._spec_accepted_per_pos)
 
     def report_batch(
         self,
@@ -119,6 +127,13 @@ class SchedulerStatusReporter:
             self._decode_generated_tokens += sum(int(e.numel()) for e in emitted)
             self._spec_accepted += sum(int(e.numel()) - 1 for e in emitted)
             self._spec_drafted += batch.spec_block * len(batch.reqs)
+            self._spec_blocks += len(batch.reqs)
+            per_pos = self._spec_accepted_per_pos
+            if len(per_pos) < batch.spec_block:
+                per_pos.extend([0] * (batch.spec_block - len(per_pos)))
+            for e in emitted:
+                for i in range(int(e.numel()) - 1):
+                    per_pos[i] += 1
         else:
             self._decode_generated_tokens += len(batch.reqs)
         if self._decode_forward_count % self.decode_log_interval != 0:

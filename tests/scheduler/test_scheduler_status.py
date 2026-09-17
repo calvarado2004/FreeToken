@@ -159,3 +159,24 @@ def test_usage_ratio_guard():
     assert _usage_ratio(0, 0) == 0.0
     assert _usage_ratio(5, 0) == 0.0
     assert _usage_ratio(5, 10) == 0.5
+
+
+def test_speculative_totals_count_accepted_drafts_by_position():
+    import torch
+
+    rep, _logs, _clock = _reporter()
+    blocks = [
+        # width 4: 2 drafts kept + bonus, and all 4 kept + bonus
+        SimpleNamespace(is_prefill=True, is_decode=False, speculative=True, spec_block=4,
+                        reqs=[_req(5, 0)], spec_emitted=[torch.tensor([1, 2, 3])]),
+        SimpleNamespace(is_prefill=True, is_decode=False, speculative=True, spec_block=4,
+                        reqs=[_req(5, 0)], spec_emitted=[torch.tensor([1, 2, 3, 4, 5])]),
+        # a narrowed block: width 1, rejected (bonus only)
+        SimpleNamespace(is_prefill=True, is_decode=False, speculative=True, spec_block=1,
+                        reqs=[_req(2, 0)], spec_emitted=[torch.tensor([9])]),
+    ]
+    for batch in blocks:
+        rep.report_batch(batch, running_reqs=1, queue_reqs=0, kv_used_pages=1, kv_total_pages=10, page_size=1)
+    accepted, drafted, n_blocks, per_pos = rep.spec_totals
+    assert (accepted, drafted, n_blocks) == (6, 9, 3)
+    assert per_pos == [2, 2, 1, 1]
