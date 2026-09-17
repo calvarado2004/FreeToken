@@ -68,6 +68,76 @@ class Glm5NextDSABackend(DSAAttnBackend):
     def reset_capture(self) -> None:
         super().reset_capture()
         self._slots_buf = None
+        self._spec = None
+
+    # ----- speculative verify graph (one request, anchor + drafts) -----------------------
+    # The verify block is staged as ``span`` decode queries over the request's one page
+    # row with live lengths T+1 .. T+span: each row attends exactly its causal prefix and
+    # selects pools like a decode step, with fixed shapes per span. KDA reads the static
+    # FLA metadata staged alongside (linear slot, [0, span]).
+    def _spec_buffers(self, span: int) -> dict:
+        spec = getattr(self, "_spec", None)
+        if spec is None or spec["rows"].shape[0] < span:
+            from . import dsa
+
+            width = dsa.get_global_ctx().page_table.shape[1]
+            dev = self.device
+            spec = self._spec = {
+                "rows": torch.full((span, width), -1, dtype=torch.int32, device=dev),
+                "kvlen": torch.zeros(span, dtype=torch.int32, device=dev),
+                "arange": torch.arange(1, span + 1, dtype=torch.int32, device=dev),
+                "ring": torch.zeros(1, dtype=torch.int64, device=dev),
+                "t2r": torch.zeros(span, dtype=torch.int32, device=dev),
+                "cu": torch.zeros(2, dtype=torch.int32, device=dev),
+                "last": torch.zeros(1, dtype=torch.int32, device=dev),
+                "slot": torch.zeros(1, dtype=torch.int32, device=dev),
+                "has_init": torch.ones(1, dtype=torch.bool, device=dev),
+            }
+        return spec
+
+    def _stage_spec_verify(self, batch: "Batch", table_idx: int, linear_slot: int, start: int) -> None:
+        from freetoken.attention.linear import FLAMetadata
+
+        from . import dsa
+
+        span = batch.input_ids.numel()
+        spec = self._spec_buffers(span)
+        spec["rows"][:span].copy_(dsa.get_global_ctx().page_table[table_idx].expand(span, -1))
+        spec["kvlen"][:span].copy_(spec["arange"][:span]).add_(start)
+        spec["ring"].fill_(table_idx)
+        spec["cu"][1].fill_(span)
+        spec["last"].fill_(span - 1)
+        spec["slot"].fill_(linear_slot)
+        kv_len = torch.tensor([start + span], dtype=torch.int32, pin_memory=True)
+        batch.attn_metadata = DSAMetadata(
+            is_decode=True,
+            last_indices=spec["last"],
+            qo_indptr_cpu=torch.tensor([0, span], dtype=torch.int32, pin_memory=True),
+            kv_len_cpu=kv_len,
+            rows=spec["rows"][:span],
+            kvlen=spec["kvlen"][:span],
+            ring_slots=spec["ring"],
+            verify_cu=spec["cu"],
+            verify_token_to_req=spec["t2r"][:span],
+        )
+        batch.fla_metadata = FLAMetadata(
+            cu_seqlens=spec["cu"], cache_indices=spec["slot"], has_initial_state=spec["has_init"],
+        )
+
+    @staticmethod
+    def _linear_slot(req) -> int:
+        slot = getattr(req, "linear_slot_idx", None)
+        return req.table_idx if slot is None else slot
+
+    def prepare_for_spec_capture(self, batch: "Batch") -> None:
+        req = batch.padded_reqs[0]
+        self._stage_spec_verify(batch, req.table_idx, self._linear_slot(req), 0)
+
+    def prepare_for_spec_replay(self, batch: "Batch") -> None:
+        if len(batch.reqs) != 1:
+            raise RuntimeError("the GLM verify graph serves one request")
+        req = batch.reqs[0]
+        self._stage_spec_verify(batch, req.table_idx, self._linear_slot(req), req.cached_len)
 
     # ----- model-family hooks -----------------------------------------------------------
     def _model_args(self, config: "ModelConfig"):
@@ -109,7 +179,11 @@ class Glm5NextDSABackend(DSAAttnBackend):
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
         t = out_loc.numel()
-        if md.is_decode:
+        if md.verify_cu is not None:
+            ring_slots = md.ring_slots
+            token_to_req = md.verify_token_to_req
+            cu_seqlens = md.verify_cu
+        elif md.is_decode:
             # One token per request. ring_slots is the backend's STATIC buffer under
             # graphs (restaged per replay in _stage_decode); eager reads the
             # scheduler-staged active_table_idx. arange shapes are fixed per capture.

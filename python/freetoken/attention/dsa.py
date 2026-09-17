@@ -94,6 +94,11 @@ class DSAMetadata(BaseAttnMetadata):
     # _stage_decode, QSA ring_slots precedent); eager decode reads active_table_idx.
     ring_slots:     torch.Tensor | None = None
     kpool_plan:     "KpoolPlan | None" = None
+    # glm5_next speculative verify graph: the block's rows ride the decode path as one
+    # query each, while the kpool store keeps them one request ([0, span], all row 0)
+    # so a pool closing inside the block reads its in-block members from this forward.
+    verify_cu:          torch.Tensor | None = None
+    verify_token_to_req: torch.Tensor | None = None
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:

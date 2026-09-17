@@ -219,8 +219,8 @@ class _SpecJournal:
     """Per-verify state the commit needs once acceptance is known."""
 
     start: int                          # anchor position
-    ring_k: torch.Tensor                # [index_layers, kpool, Di] tail rings before drafting
-    ring_gate: torch.Tensor
+    ring_k: torch.Tensor | None         # [index_layers, kpool, Di] tail rings before drafting
+    ring_gate: torch.Tensor | None
     kda: list = field(default_factory=list)    # KDAVerifyRows, one per KDA layer
     index: list = field(default_factory=list)  # (slot, k [rows, Di], gate [rows, Di])
 
@@ -267,6 +267,9 @@ class Glm5NextForCausalLM(BaseLLMModel):
         self._think_end_id: int | None = None
         self._thinking_width: int | None = None
         self._think_scan: tuple = (None, 0, False)
+        # Verify-graph journals by span: a replay runs no Python, so the rows the capture
+        # recorded (graph-owned tensors, rewritten by every replay) are what commit reads.
+        self._graph_journals: dict[int, _SpecJournal] = {}
 
     def full_logits(self, h: torch.Tensor) -> torch.Tensor:
         """Full-vocabulary logits for EVERY row of ``h`` (ParallelLMHead.forward keeps one row per
@@ -444,13 +447,20 @@ class Glm5NextForCausalLM(BaseLLMModel):
         return proposed, q, confidence
 
     @torch.no_grad()
-    def commit_speculative(self, batch, accepted: List[int], emitted: List[torch.Tensor]) -> None:
+    def commit_speculative(
+        self, batch, accepted: List[int], emitted: List[torch.Tensor], features: MTPTargetFeatures | None = None,
+    ) -> None:
         """Roll per-token state back to the accepted prefix, then seed the next block."""
         journal: _SpecJournal | None = getattr(batch, "spec_journal", None)
         batch.spec_journal = None
         self._draft_seed = None
         if journal is None:
             raise RuntimeError("an MTP verify finished without its journal")
+        if getattr(batch, "spec_verify_decode", False) and not journal.kda:
+            captured = self._graph_journals.get(int(batch.spec_block) + 1)
+            if captured is None:
+                raise RuntimeError(f"no captured verify journal for span {int(batch.spec_block) + 1}")
+            journal.kda, journal.index = captured.kda, captured.index
         ctx = get_global_ctx()
         req = batch.reqs[0]
         span = int(batch.spec_block) + 1
@@ -471,11 +481,12 @@ class Glm5NextForCausalLM(BaseLLMModel):
             kv.tail_k(slot)[r].index_copy_(0, residues, k_rows.index_select(0, keep_rows).to(kv._tail_k.dtype))
             kv.tail_gate(slot)[r].index_copy_(0, residues, gate_rows.index_select(0, keep_rows).to(kv._tail_gate.dtype))
 
-        if self._last_hidden is None:
+        hidden = features.hidden if features is not None else self._last_hidden
+        if hidden is None or not self.mtp_layers.op_list:
             return
         tokens = emitted[0].to(dev, non_blocking=True).long()  # accepted drafts + bonus
         with self._rows(batch, journal.start, 0, n + 1):
-            out = self._mtp_rows(tokens, batch.positions, self._last_hidden[: n + 1])
+            out = self._mtp_rows(tokens, batch.positions, hidden[: n + 1])
         self._seed(req, journal.start + n + 1, out[n : n + 1])
 
     def prepare_for_runtime(self) -> None:
@@ -490,6 +501,13 @@ class Glm5NextForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
         input_ids = batch.input_ids
+        if getattr(batch, "spec_verify_decode", False) and torch.cuda.is_current_stream_capturing():
+            # Graph capture of a verify: record this span's rows for every later replay.
+            journal = _SpecJournal(start=0, ring_k=None, ring_gate=None)
+            batch.spec_journal = journal
+            self._graph_journals[input_ids.numel()] = journal
+        elif getattr(batch, "spec_verify_decode", False) and getattr(batch, "spec_journal", None) is None:
+            batch.spec_journal = _SpecJournal(start=0, ring_k=None, ring_gate=None)  # capture warmup
         output = self.model.forward(input_ids)
         if self.mtp_layers.op_list:
             self._last_hidden = output

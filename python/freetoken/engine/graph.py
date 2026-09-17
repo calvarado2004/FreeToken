@@ -402,7 +402,7 @@ class GraphRunner:
                         with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                             self.spec_buffer.logits[:tokens] = model.forward()
                         self._reset_moe_offload_cache()
-                    if shared_carry is None and adaptive_single_req:
+                    if shared_carry is None and adaptive_single_req and batch.spec_carry_states:
                         # Spans are descending, so this is the maximum graph. Its
                         # captured outputs become the one persistent journal backing
                         # all remaining prefix graphs.

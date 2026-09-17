@@ -490,6 +490,8 @@ class Engine:
         if config.speculative_mtp and configure_phases is not None:
             thinking = config.speculative_mtp_thinking_steps or None
             configure_phases(_added_token_id(config.model_path, "</think>"), thinking)
+            # The graph runner captures one verify graph per anchor + prefix width.
+            self.model.speculative_verify_block_size = int(config.speculative_mtp_steps)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
 
@@ -1257,7 +1259,9 @@ class Engine:
                 self.config.dspark_fallback_min_drafted,
                 self.config.dspark_fallback_steps,
             )
-        if not curve or block_size < 1:
+        if not curve or block_size < 1 or self.config.speculative_mtp:
+            # MTP drafts sequentially and has no confidence head to price widths with, so
+            # it keeps the fixed width (phase-narrowed) plus the acceptance fallback.
             return
         if self.config.max_running_req != 1:
             logger.warning_rank0(
@@ -1587,7 +1591,7 @@ class Engine:
             # The model rolls its own per-token state back to the accepted prefix (GLM:
             # KDA recurrent/conv state, indexer tail rings) and catches its drafter up.
             with self.ctx.forward_batch(batch):
-                commit(batch, accepted_counts, emitted)
+                commit(batch, accepted_counts, emitted, target_features)
         else:
             # Select the target's saved compressor state after anchor + accepted prefix.
             # Later rejected rows may share its 128-token page and overwrite the live ring.

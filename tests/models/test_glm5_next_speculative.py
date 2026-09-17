@@ -43,9 +43,42 @@ def _close(got: torch.Tensor, want: torch.Tensor, what: str, tol: float = 3e-2) 
     assert err / scale < tol, f"{what}: {err} (scale {scale})"
 
 
+def _cache_tensors(ctx) -> list[torch.Tensor]:
+    pool, kv = ctx.linear_state_pool, ctx.kv_cache
+    return [pool.recurrent_states, pool.conv_states, kv._kv_buffer, kv._index_k_buffer, kv._tail_k, kv._tail_gate]
+
+
+def _verify(model, ctx, batch, mode: str) -> torch.Tensor:
+    """Run the prepared verify block eagerly on the prefill path, eagerly on the
+    decode-shaped graph path, or captured into a CUDA graph and replayed."""
+    if mode == "prefill":
+        return model.forward().float()
+    batch.spec_verify_decode = True
+    ctx.attn_backend.prepare_for_spec_replay(batch)
+    if mode == "decode":
+        return model.forward().float()
+    saved = [t.clone() for t in _cache_tensors(ctx)]
+    journal = batch.spec_journal
+    batch.spec_journal = None
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        model.forward()  # warmup (autotune) outside the graph
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = model.forward()
+    for live, before in zip(_cache_tensors(ctx), saved):
+        live.copy_(before)  # capture ran the block twice; replay must start clean
+    batch.spec_journal = journal
+    ctx.attn_backend.prepare_for_spec_replay(batch)
+    graph.replay()
+    return out.float()
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode", "graph"])
 @pytest.mark.parametrize("start", [40, 42])
 @pytest.mark.parametrize("accepted", [0, 2, K])
-def test_verify_commit_matches_token_by_token_decode(rig, start, accepted):
+def test_verify_commit_matches_token_by_token_decode(rig, start, accepted, mode):
     from freetoken.models.glm5_next.model import _SpecJournal
 
     model, ctx = rig
@@ -76,7 +109,7 @@ def test_verify_commit_matches_token_by_token_decode(rig, start, accepted):
     batch.spec_journal = _SpecJournal(
         start=start, ring_k=kv._tail_k[:, 0].clone(), ring_gate=kv._tail_gate[:, 0].clone()
     )
-    rows = model.forward().float()
+    rows = _verify(model, ctx, batch, mode)
     assert rows.shape == (K + 1, _rig.VOCAB)
     for j in range(accepted + 1):
         _close(rows[j], ref_logits[j], f"verify row {j}")

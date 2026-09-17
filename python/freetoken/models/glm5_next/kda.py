@@ -212,27 +212,25 @@ class Glm5NextKDA(BaseOP):
         return self.o_proj.forward(out.to(dtype))
 
     def _verify(self, conv_in, g1, b, pool, li, fla, journal) -> torch.Tensor:
-        """Speculative verify over equal ``1 + k`` spans per request.
+        """Speculative verify over equal ``1 + k`` spans per request (CUDA-graph safe).
 
         Outputs every row exactly as decode would, but leaves the recurrent state at the
         ANCHOR row: the kernel's 2-D state indices write row 0 into the live slot and skip
-        the draft rows (-1). The conv kernel refreshes the window to the end of the span,
-        so the pre-verify window is saved for the rollback in :meth:`commit_verify`.
+        the draft rows (-1). The conv runs out of place over ``window | rows`` and writes
+        no state; :meth:`commit_verify` sets the window for the accepted prefix.
         """
         h, d, p = self.num_heads, self.head_dim, self.proj_size
         total = conv_in.shape[0]
         live = fla.cache_indices.to(torch.int64)
         n_req = live.numel()
         span = total // n_req
-        assert span * n_req == total and span > 1, "a verify has equal spans of anchor + drafts"
-        window = pool.conv_states[li].index_select(0, live)
-        conv_raw = conv_in.clone()  # the varlen conv writes its output over its input
-        mixed = causal_conv1d_varlen(
-            conv_in.transpose(0, 1).contiguous(), self._conv_weight(), pool.conv_states[li],
-            fla.cu_seqlens, fla.cache_indices, fla.has_initial_state,
-        ).transpose(0, 1)
+        assert span * n_req == total, "a verify has equal spans of anchor + drafts"
+        window = pool.conv_states[li].index_select(0, live)  # [N, C, kernel-1]
+        x = torch.cat([window.to(conv_in.dtype), conv_in.view(n_req, span, -1).transpose(1, 2)], dim=-1)
+        mixed = torch.nn.functional.conv1d(x, self.conv1d.weight.to(x.dtype), groups=self.conv_dim)
+        mixed = (mixed * torch.sigmoid(mixed)).transpose(1, 2).reshape(total, -1)  # silu
         q, k, v = (
-            t.reshape(1, total, h, d).to(conv_in.dtype)
+            t.reshape(1, total, h, d).contiguous()
             for t in torch.split(mixed, [p, p, p], dim=-1)
         )
         indices = torch.full((n_req, span), -1, dtype=torch.int32, device=conv_in.device)
@@ -249,7 +247,7 @@ class Glm5NextKDA(BaseOP):
             lower_bound=self.lower_bound,
             scale=self.scale,
         )
-        journal.kda.append(KDAVerifyRows(self, live, window, conv_raw, q, k, v, g1, b))
+        journal.kda.append(KDAVerifyRows(self, live, window, conv_in, q, k, v, g1, b))
         return core_out
 
     def commit_verify(self, rows: KDAVerifyRows, accepted: list[int], span: int) -> None:
@@ -262,12 +260,11 @@ class Glm5NextKDA(BaseOP):
         for i, n in enumerate(accepted):
             base = i * span
             slot = rows.live[i : i + 1]
-            if n + 1 < span:
-                seq = torch.cat(
-                    [rows.window[i], rows.conv_in[base : base + n + 1].transpose(0, 1).to(conv.dtype)],
-                    dim=-1,
-                )
-                conv.index_copy_(0, slot, seq[:, -km1:].unsqueeze(0))
+            seq = torch.cat(
+                [rows.window[i], rows.conv_in[base : base + n + 1].transpose(0, 1).to(conv.dtype)],
+                dim=-1,
+            )
+            conv.index_copy_(0, slot, seq[:, -km1:].unsqueeze(0))
             if n == 0:
                 continue
             lo, hi = base + 1, base + 1 + n
