@@ -69,6 +69,22 @@ _MTP_RANK_CHECK = os.environ.get("FREETOKEN_GLM_MTP_RANK_CHECK", "0") == "1"
 # FREETOKEN_GLM_MTP_STAGED_EAGER=1 (debug): keep the graphs' decode-shaped staging but run the
 # layer eagerly instead of replaying, to tell a data fault from a replay fault.
 _MTP_STAGED_EAGER = os.environ.get("FREETOKEN_GLM_MTP_STAGED_EAGER", "0") == "1"
+# FREETOKEN_GLM_MTP_MODE_FILE=<path> (debug): the file's content picks the MTP path per call --
+# "staged" (decode-shaped staging, eager), "parts" (attention replayed as four synced graphs),
+# anything else / no file: the captured graphs. Parts graphs are captured only with this set.
+_MTP_MODE_FILE = os.environ.get("FREETOKEN_GLM_MTP_MODE_FILE")
+
+
+def _mtp_mode() -> str:
+    if _MTP_STAGED_EAGER:
+        return "staged"
+    if not _MTP_MODE_FILE:
+        return "graph"
+    try:
+        with open(_MTP_MODE_FILE) as f:
+            return f.read().strip() or "graph"
+    except OSError:
+        return "graph"
 
 
 def _assert_ranks_agree(tag: str, *values) -> None:
@@ -363,6 +379,7 @@ class Glm5NextForCausalLM(BaseLLMModel):
         self._mtp_graphs: dict[int, tuple] = {}
         self._mtp_buf: dict[str, torch.Tensor] | None = None
         self._mtp_check_left = _MTP_GRAPH_CHECK
+        self._mtp_part_graphs: dict[int, dict] = {}
 
     def full_logits(self, h: torch.Tensor) -> torch.Tensor:
         """Full-vocabulary logits for EVERY row of ``h`` (ParallelLMHead.forward keeps one row per
@@ -555,11 +572,64 @@ class Glm5NextForCausalLM(BaseLLMModel):
                     with torch.cuda.graph(graph, pool=pool, stream=stream):
                         x, normed = mtp.pre_moe(self.model.embed_tokens.forward(args[0]), args[1], args[2])
                     entry = (graph, x, normed)
+                if _MTP_MODE_FILE:
+                    self._mtp_part_graphs[span] = self._capture_attention_parts(batch, args, pool, stream)
                 reset_moe()
             self._mtp_graphs[span] = entry
         logger.info_rank0(
             f"Captured MTP draft graphs for 1..{max_span} rows ({'with' if _MTP_GRAPH_MOE else 'without'} the MoE)"
         )
+
+    def _attention_parts(self):
+        """The MTP attention as four callables sharing tensors: projections, stores, attend, output."""
+        from freetoken.attention.dsa import DSAIndexerInputs
+
+        mtp = self.mtp_layers.op_list[0]
+        attn, backend = mtp.self_attn, get_global_ctx().attn_backend
+        st: dict = {}
+
+        def p1():
+            h = mtp.input_layernorm.forward(st["xin"])
+            t = h.shape[0]
+            w_uk, _ = attn._kv_b()
+            q_a_resid = attn.q_a_layernorm.forward(attn.q_a_proj.forward(h))
+            q_nope = attn.q_b_proj.forward(q_a_resid).view(t, attn.num_heads, attn.qk_head_dim)
+            st["c_kv"] = attn.kv_a_layernorm.forward(attn.kv_a_proj_with_mqa.forward(h)).contiguous()
+            st["q_abs"] = torch.bmm(q_nope.transpose(0, 1).contiguous(), w_uk).transpose(0, 1).contiguous()
+            st["inputs"] = attn.indexer.compute(h, q_a_resid)
+
+        def p2():
+            batch = get_global_ctx().batch
+            c_kv = st["c_kv"]
+            backend.kvcache.store_kv(c_kv, c_kv.new_empty(c_kv.shape[0], 0), batch.out_loc, attn.layer_id)
+            backend._store_index(st["inputs"], batch, attn.layer_id)
+
+        def p3():
+            q_abs = st["q_abs"]
+            md = get_global_ctx().batch.attn_metadata
+            st["o_latent"] = backend._decode(md, attn.layer_id, q_abs, q_abs.new_empty(q_abs.shape[0], attn.num_heads, 0), st["inputs"])
+
+        def p4():
+            _, w_uv = attn._kv_b()
+            o_latent = st["o_latent"]
+            t = o_latent.shape[0]
+            o = torch.bmm(o_latent.transpose(0, 1).contiguous(), w_uv).transpose(0, 1)
+            st["out"] = attn.o_proj.forward(o.reshape(t, attn.num_heads * attn.v_head_dim))
+
+        return st, (p1, p2, p3, p4)
+
+    def _capture_attention_parts(self, batch, args, pool, stream) -> dict:
+        mtp = self.mtp_layers.op_list[0]
+        st, parts = self._attention_parts()
+        st["xin"] = mtp.project_input(self.model.embed_tokens.forward(args[0]), args[1], args[2]).clone()
+        graphs = []
+        for part in parts:
+            part()  # warm outside the graph
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=pool, stream=stream):
+                part()
+            graphs.append(g)
+        return {"st": st, "graphs": graphs}
 
     def _mtp_run(self, batch, start: int, lo: int, hi: int, tokens: torch.Tensor, hidden: torch.Tensor):
         """MTP output rows and last-row logits for positions ``start+lo .. start+hi-1`` of the
@@ -587,7 +657,29 @@ class Glm5NextForCausalLM(BaseLLMModel):
         slot = req.linear_slot_idx if getattr(req, "linear_slot_idx", None) is not None else req.table_idx
         try:
             backend._stage_spec_verify(batch, req.table_idx, slot, start + lo)
-            if _MTP_STAGED_EAGER:
+            mode = _mtp_mode()
+            if mode == "parts" and span in self._mtp_part_graphs:
+                mtp = self.mtp_layers.op_list[0]
+                parts = self._mtp_part_graphs[span]
+                st = parts["st"]
+                saved_pos, saved_loc = batch.positions, batch.out_loc
+                batch.positions, batch.out_loc = buf["positions"][:span], buf["out_loc"][:span]
+                try:
+                    x0 = mtp.project_input(self.model.embed_tokens.forward(buf["tokens"][:span]), buf["positions"][:span], buf["hidden"][:span])
+                    st["xin"].copy_(x0)
+                    for i, g in enumerate(parts["graphs"], start=1):
+                        torch.cuda.synchronize()
+                        g.replay()
+                        torch.cuda.synchronize()
+                        logger.info(f"MTP parts: p{i} ok (span {span}, start {start + lo})")
+                finally:
+                    batch.positions, batch.out_loc = saved_pos, saved_loc
+                x = st["xin"] + st["out"]
+                out = mtp.post_moe(x, mtp.mlp.forward(mtp.post_attention_layernorm.forward(x)))
+                logits = self.full_logits(out[span - 1 : span])
+                batch.input_ids, batch.attn_metadata, batch.fla_metadata = saved
+                return out, logits
+            if mode == "staged":
                 mtp = self.mtp_layers.op_list[0]
                 saved_pos, saved_loc = batch.positions, batch.out_loc
                 batch.positions, batch.out_loc = buf["positions"][:span], buf["out_loc"][:span]
