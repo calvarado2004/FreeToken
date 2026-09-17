@@ -17,5 +17,9 @@ export SPECULATIVE_DSPARK=0
 export DSPARK_FALLBACK_ACCEPTANCE=0
 # MLA keeps one 512-wide latent per token, so a large KV floor costs little VRAM next to experts.
 export KV_RESERVE_TOKENS="${KV_RESERVE_TOKENS:-131072}"
+# Z.ai's recommended sampling (model card); the checkpoint's generation_config.json only
+# carries temperature, so without these an API client that sends nothing gets top_p 1.0.
+export DEFAULT_TEMPERATURE="${DEFAULT_TEMPERATURE:-1.0}"
+export DEFAULT_TOP_P="${DEFAULT_TOP_P:-0.95}"
 
 exec /usr/bin/bash "$(dirname "$(readlink -f "$0")")/freetoken-dsv4.sh" "$@"
