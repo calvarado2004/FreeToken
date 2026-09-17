@@ -63,6 +63,24 @@ _MTP_GRAPHS = os.environ.get("FREETOKEN_GLM_MTP_GRAPHS", "1") != "0"
 _MTP_GRAPH_MOE = os.environ.get("FREETOKEN_GLM_MTP_GRAPH_MOE", "0") == "1"
 # FREETOKEN_GLM_MTP_GRAPH_SPLIT=1 (debug): two graphs per span, input projection then attention.
 _MTP_GRAPH_SPLIT = os.environ.get("FREETOKEN_GLM_MTP_GRAPH_SPLIT", "0") == "1"
+# FREETOKEN_GLM_MTP_RANK_CHECK=1 (debug): every MTP forward asserts all TP ranks agree on its
+# shape-deciding host values; a mismatch would pair collectives of different sizes.
+_MTP_RANK_CHECK = os.environ.get("FREETOKEN_GLM_MTP_RANK_CHECK", "0") == "1"
+
+
+def _assert_ranks_agree(tag: str, *values) -> None:
+    from freetoken.distributed import get_tp_info
+
+    tp = get_tp_info()
+    if not _MTP_RANK_CHECK or tp.size == 1:
+        return
+    import torch.distributed as dist
+
+    mine = (tag, *[int(v) for v in values])
+    gathered = [None] * tp.size
+    dist.all_gather_object(gathered, mine)
+    if any(g != gathered[0] for g in gathered):
+        raise RuntimeError(f"TP ranks diverged at {tag}: {gathered}")
 
 
 class Glm5NextDecoderLayer(BaseOP):
@@ -544,6 +562,7 @@ class Glm5NextForCausalLM(BaseLLMModel):
         """MTP output rows and last-row logits for positions ``start+lo .. start+hi-1`` of the
         batch's one request: a captured graph when one fits, else the eager layer."""
         span = hi - lo
+        _assert_ranks_agree("mtp_run", start, lo, hi, tokens.numel(), hidden.shape[0])
         entry = self._mtp_graphs.get(span)
         if entry is None:
             if batch.is_decode and lo == 0 and hi == batch.positions.numel():
@@ -686,6 +705,7 @@ class Glm5NextForCausalLM(BaseLLMModel):
         req = batch.reqs[0]
         span = int(batch.spec_block) + 1
         n = accepted[0]
+        _assert_ranks_agree("commit", journal.start, span, n, int(emitted[0].numel()), int(emitted[0][-1]))
         for rows in journal.kda:
             rows.layer.commit_verify(rows, accepted, span)
 
