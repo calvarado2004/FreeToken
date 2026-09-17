@@ -341,8 +341,22 @@ def _cpu_moe_max_tokens(config: EngineConfig) -> int:
         rows_per_req = 1 + max(
             1, int(getattr(dsv4, "dspark_block_size", 1) or 1)
         )
+    elif getattr(config, "speculative_mtp", False):
+        rows_per_req = 1 + max(1, int(config.speculative_mtp_steps))
     max_reqs = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
     return max_reqs * rows_per_req
+
+
+def _added_token_id(model_path: str, content: str) -> int | None:
+    """An added special token's id from the checkpoint's tokenizer.json, or None."""
+    import json
+
+    try:
+        with open(os.path.join(model_path, "tokenizer.json")) as f:
+            added = json.load(f).get("added_tokens", [])
+    except (OSError, ValueError):
+        return None
+    return next((int(t["id"]) for t in added if t.get("content") == content), None)
 
 
 def _bind_rank_to_numa_node(tp_info) -> None:
@@ -431,6 +445,12 @@ class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        if getattr(config, "speculative_mtp", False):
+            # A rank process receives the config pickled, without __post_init__: the weight
+            # readers re-parse the checkpoint here and must see the same MTP layers.
+            from freetoken.models.glm5_next.args import set_mtp_enabled
+
+            set_mtp_enabled(True)
         set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
         _ensure_expandable_segments()  # before the first CUDA allocation below
         # Bind BEFORE any allocation: the expert banks land on the node that
@@ -466,6 +486,12 @@ class Engine:
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
         finalize_quant(self.model)
+        configure_phases = getattr(self.model, "configure_speculative_phases", None)
+        if config.speculative_mtp and configure_phases is not None:
+            thinking = config.speculative_mtp_thinking_steps or None
+            configure_phases(_added_token_id(config.model_path, "</think>"), thinking)
+            # The graph runner captures one verify graph per anchor + prefix width.
+            self.model.speculative_verify_block_size = int(config.speculative_mtp_steps)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
 
@@ -1197,10 +1223,33 @@ class Engine:
     def _init_dspark_adaptive_verification(self) -> None:
         """Install the paper's measured-cost scheduler when every prefix is captured."""
         self._adaptive_verification = None
+        self._mtp_fallback = None
+        self._mtp_fallback_uid = None
         curve = list(getattr(self.graph_runner, "spec_verify_cost_curve", ()) or ())
         block_size = int(getattr(self.graph_runner, "spec_block_size", 0) or 0)
+        if self.config.speculative_mtp and self.config.dspark_fallback_acceptance > 0:
+            # Without profiled verify graphs (no width curve) MTP keeps a fixed width and takes
+            # the acceptance circuit breaker alone: the same measured-acceptance rule DSpark uses.
+            from freetoken.models.deepseek_v4.dspark import DSparkAcceptanceFallback
+
+            self._mtp_fallback = DSparkAcceptanceFallback(
+                self.config.dspark_fallback_acceptance,
+                self.config.dspark_fallback_min_drafted,
+                self.config.dspark_fallback_steps,
+            )
+            logger.info_rank0(
+                "MTP acceptance fallback enabled: threshold=%.1f%%, min-drafted=%d, "
+                "target-only-steps=%d",
+                100.0 * self.config.dspark_fallback_acceptance,
+                self.config.dspark_fallback_min_drafted,
+                self.config.dspark_fallback_steps,
+            )
         if not curve or block_size < 1:
             return
+        if self.config.speculative_mtp:
+            # The profiled scheduler carries its own acceptance fallback; MTP prices widths
+            # with each proposal's draft probability in place of a confidence head.
+            self._mtp_fallback = None
         if self.config.max_running_req != 1:
             logger.warning_rank0(
                 "DSpark adaptive verification needs the paper's marker-tensor varlen "
@@ -1241,8 +1290,29 @@ class Engine:
         """Return whether this request should pay for a DSpark draft this step."""
         manager = self._adaptive_verification
         if manager is None:
-            return True
+            fallback = self._mtp_fallback_for(req)
+            if fallback is None:
+                return True
+            speculate, resumed = fallback.take_decision()
+            if resumed:
+                logger.info_rank0(
+                    "MTP fallback: request %d probing speculation after %d target-only steps",
+                    req.uid, fallback.cooldown_steps,
+                )
+            return speculate
         return manager.should_speculate(req.uid)
+
+    def _mtp_fallback_for(self, req: Req):
+        fallback = getattr(self, "_mtp_fallback", None)
+        if fallback is not None and self._mtp_fallback_uid != req.uid:
+            fallback.reset()
+            self._mtp_fallback_uid = req.uid
+        return fallback
+
+    def speculative_width(self, req: Req, max_width: int) -> int:
+        """Per-request draft width; the model may narrow it (GLM MTP: shorter while thinking)."""
+        choose = getattr(self.model, "speculative_width", None)
+        return max_width if choose is None else int(choose(req, max_width))
 
     def _record_dspark_acceptance(
         self, req: Req, accepted: int, drafted: int
@@ -1250,6 +1320,17 @@ class Engine:
         manager = self._adaptive_verification
         if manager is not None:
             manager.record_acceptance(req.uid, accepted, drafted)
+            return
+        fallback = self._mtp_fallback_for(req)
+        if fallback is None:
+            return
+        trip = fallback.record(accepted, drafted)
+        if trip is not None:
+            rate, measured = trip
+            logger.info_rank0(
+                "MTP fallback: request %d accepted %.1f%% of %d proposals; target-only for %d steps",
+                req.uid, 100.0 * rate, measured, fallback.cooldown_steps,
+            )
 
     def adapt_speculative_batch(self, batch: Batch) -> None:
         """Compact one prepared DSpark block to the paper-selected prefix width.
@@ -1284,6 +1365,12 @@ class Engine:
 
         base = req.input_ids.numel() - max_width
         span = width + 1
+        if getattr(batch.attn_metadata, "segments", None) is None and not (
+            self.graph_runner.can_use_spec_cuda_graph_span(batch, span)
+        ):
+            # Segment-free backends (GLM) restage their verify metadata from the trimmed
+            # rows at graph replay; without that graph there is no metadata to shrink.
+            return
         req.input_ids = req._ids_buf[: base + width]
         batch.input_ids = batch.input_ids[:span]
         batch.positions = batch.positions[:span]
@@ -1295,10 +1382,11 @@ class Engine:
         batch.draft_probs = batch.draft_probs[:width]
         batch.draft_confidence = confidence[:width]
         segments = getattr(batch.attn_metadata, "segments", None)
-        if segments is None or len(segments) != 1:
-            raise RuntimeError("adaptive DSpark needs one target metadata segment")
-        _off, _old_n, table_idx, start_pos = segments[0]
-        batch.attn_metadata.segments = [(0, span, table_idx, start_pos)]
+        if segments is not None:
+            if len(segments) != 1:
+                raise RuntimeError("adaptive DSpark needs one target metadata segment")
+            _off, _old_n, table_idx, start_pos = segments[0]
+            batch.attn_metadata.segments = [(0, span, table_idx, start_pos)]
         batch.spec_block = width
 
     def _record_adaptive_draft_cost(self, batch: Batch) -> None:
@@ -1492,13 +1580,20 @@ class Engine:
             accepted_counts.append(n_acc)
             off += span
 
-        # Select the target's saved compressor state after anchor + accepted prefix.
-        # Later rejected rows may share its 128-token page and overwrite the live ring.
-        self._restore_speculative_carry(batch, selected_rows)
-        committed_features = self._trim_dspark_target_features(
-            target_features, batch, accepted_counts
-        )
-        self._commit_dspark_target_features(committed_features)
+        commit = getattr(self.model, "commit_speculative", None)
+        if commit is not None:
+            # The model rolls its own per-token state back to the accepted prefix (GLM:
+            # KDA recurrent/conv state, indexer tail rings) and catches its drafter up.
+            with self.ctx.forward_batch(batch):
+                commit(batch, accepted_counts, emitted, target_features)
+        else:
+            # Select the target's saved compressor state after anchor + accepted prefix.
+            # Later rejected rows may share its 128-token page and overwrite the live ring.
+            self._restore_speculative_carry(batch, selected_rows)
+            committed_features = self._trim_dspark_target_features(
+                target_features, batch, accepted_counts
+            )
+            self._commit_dspark_target_features(committed_features)
 
         # The reply path reads one token per request; hand it the LAST emitted token and
         # let the scheduler read the rest off req.input_ids, which already holds them.
@@ -1725,15 +1820,22 @@ class Engine:
                 self._spec_timing_left -= 1
             return output
 
-        self._commit_dspark_target_features(
-            self._real_dspark_target_features(target_features, batch)
-        )
+        commit_target = getattr(self.model, "commit_target_forward", None)
+        if commit_target is None:
+            self._commit_dspark_target_features(
+                self._real_dspark_target_features(target_features, batch)
+            )
 
         for req in batch.reqs:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if commit_target is not None:
+            # After sampling: the drafter's catch-up row for the last position consumes
+            # the token this step just chose.
+            with self.ctx.forward_batch(batch):
+                commit_target(batch, target_features, next_tokens_gpu)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

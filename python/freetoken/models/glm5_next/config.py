@@ -130,6 +130,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
 
     kda_ids = tuple(i for i in args.kda_layer_ids if i < num_layers)
     dsa_ids = tuple(i for i in args.dsa_layer_ids if i < num_layers)
+    # An MTP layer is an MLA/DSA block with its own indexer and routed experts; it only exists
+    # on top of the full stack (a dev layer cap drops it).
+    mtp_ids = args.mtp_layer_ids if num_layers == len(args.layer_types) else ()
 
     # NoPE: the main attention carries no rotary dims (rotary_dim == 0); rope
     # survives only in the indexer geometry (args.rope_theta / interleave).
@@ -153,7 +156,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         )
         if dsa_on
         else 0
-    )
+    ) + (len(mtp_ids) if dsa_on else 0)
 
     linear_group = LinearGatedDeltaGroupConfig(
         name="linear",
@@ -171,7 +174,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
     full_group = FullAttentionGroupConfig(
         name="full",
-        layer_ids=dsa_ids,
+        layer_ids=dsa_ids + mtp_ids,
         num_kv_heads=1,  # single shared MLA latent
         head_dim=latent_dim,
         rotary_config=rotary_config,
@@ -238,6 +241,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
         first_k_dense_replace=first_dense,
+        extra_moe_layers=len(mtp_ids),
         n_shared_experts=int(getattr(text, "n_shared_experts", 0) or 0),
         routed_scaling_factor=float(getattr(text, "routed_scaling_factor", 1.0)),
         n_group=int(getattr(text, "n_group", 1) or 1),

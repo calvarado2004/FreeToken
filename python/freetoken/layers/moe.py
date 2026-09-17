@@ -356,6 +356,11 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if getattr(get_global_ctx().batch, "speculative", False) and cache.decode_target == "hybrid":
+            # A speculative verify is a few rows per request on the decode critical path:
+            # streaming whole layers for it costs far more than the capped hybrid fetch
+            # (same rule as DeepseekV4's MoE, models/deepseek_v4/moe.py).
+            return self._decode_routed(hidden_states, topk_weights, topk_ids)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(

@@ -74,6 +74,8 @@ class Glm5NextArgs:
     # ---- misc ----
     swiglu_limit: float | None
     rope_theta: float  # indexer-side only; the main attention is NoPE
+    # ---- MTP (next-token-prediction layers appended after the decoder stack) ----
+    num_nextn_predict_layers: int = 0
 
     @property
     def qk_head_dim(self) -> int:
@@ -92,8 +94,33 @@ class Glm5NextArgs:
     def dsa_layer_ids(self) -> Tuple[int, ...]:
         return tuple(i for i, t in enumerate(self.layer_types) if t == DSA_LAYER)
 
+    @property
+    def mtp_layer_ids(self) -> Tuple[int, ...]:
+        """The MTP layers this run serves: ids continue the decoder stack (``num_layers + k``),
+        so the KV pool, the indexer slab and the expert banks address them like decoder layers.
+        Empty unless the checkpoint ships them AND the run enabled ``--speculative-mtp``."""
+        if not _MTP_ENABLED:
+            return ()
+        n = len(self.layer_types)
+        return tuple(range(n, n + self.num_nextn_predict_layers))
+
     def is_kda_layer(self, layer_id: int) -> bool:
         return self.layer_types[layer_id] == KDA_LAYER
+
+
+_MTP_ENABLED = False
+
+
+def set_mtp_enabled(enabled: bool) -> None:
+    """Record the run's MTP choice for every later ``parse_config``: the config resolution, the
+    weight reader and the expert-bank builder each parse the checkpoint on their own, and the
+    checkpoint only says which MTP weights exist, never whether this run serves them."""
+    global _MTP_ENABLED
+    _MTP_ENABLED = enabled
+
+
+def mtp_enabled() -> bool:
+    return _MTP_ENABLED
 
 
 def _require_mhc(mhc: bool) -> bool:
@@ -219,7 +246,8 @@ def load_args(hf_config: Any) -> Glm5NextArgs:
         mhc_no_norm_weight=bool(_get(text, "mhc_no_norm_weight", False)),
         swiglu_limit=(None if swiglu_limit is None else float(swiglu_limit)),
         rope_theta=rope_theta,
+        num_nextn_predict_layers=int(_get(text, "num_nextn_predict_layers", 0) or 0),
     )
 
 
-__all__ = ["Glm5NextArgs", "load_args", "KDA_LAYER", "DSA_LAYER"]
+__all__ = ["Glm5NextArgs", "load_args", "KDA_LAYER", "DSA_LAYER", "mtp_enabled", "set_mtp_enabled"]

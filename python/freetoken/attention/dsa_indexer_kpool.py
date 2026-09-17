@@ -68,6 +68,76 @@ class Glm5NextDSABackend(DSAAttnBackend):
     def reset_capture(self) -> None:
         super().reset_capture()
         self._slots_buf = None
+        self._spec = None
+
+    # ----- speculative verify graph (one request, anchor + drafts) -----------------------
+    # The verify block is staged as ``span`` decode queries over the request's one page
+    # row with live lengths T+1 .. T+span: each row attends exactly its causal prefix and
+    # selects pools like a decode step, with fixed shapes per span. KDA reads the static
+    # FLA metadata staged alongside (linear slot, [0, span]).
+    def _spec_buffers(self, span: int) -> dict:
+        spec = getattr(self, "_spec", None)
+        if spec is None or spec["rows"].shape[0] < span:
+            from . import dsa
+
+            width = dsa.get_global_ctx().page_table.shape[1]
+            dev = self.device
+            spec = self._spec = {
+                "rows": torch.full((span, width), -1, dtype=torch.int32, device=dev),
+                "kvlen": torch.zeros(span, dtype=torch.int32, device=dev),
+                "arange": torch.arange(1, span + 1, dtype=torch.int32, device=dev),
+                "ring": torch.zeros(1, dtype=torch.int64, device=dev),
+                "t2r": torch.zeros(span, dtype=torch.int32, device=dev),
+                "cu": torch.zeros(2, dtype=torch.int32, device=dev),
+                "last": torch.zeros(1, dtype=torch.int32, device=dev),
+                "slot": torch.zeros(1, dtype=torch.int32, device=dev),
+                "has_init": torch.ones(1, dtype=torch.bool, device=dev),
+            }
+        return spec
+
+    def _stage_spec_verify(self, batch: "Batch", table_idx: int, linear_slot: int, start: int) -> None:
+        from freetoken.attention.linear import FLAMetadata
+
+        from . import dsa
+
+        span = batch.input_ids.numel()
+        spec = self._spec_buffers(span)
+        spec["rows"][:span].copy_(dsa.get_global_ctx().page_table[table_idx].expand(span, -1))
+        spec["kvlen"][:span].copy_(spec["arange"][:span]).add_(start)
+        spec["ring"].fill_(table_idx)
+        spec["cu"][1].fill_(span)
+        spec["last"].fill_(span - 1)
+        spec["slot"].fill_(linear_slot)
+        kv_len = torch.tensor([start + span], dtype=torch.int32, pin_memory=True)
+        batch.attn_metadata = DSAMetadata(
+            is_decode=True,
+            last_indices=spec["last"],
+            qo_indptr_cpu=torch.tensor([0, span], dtype=torch.int32, pin_memory=True),
+            kv_len_cpu=kv_len,
+            rows=spec["rows"][:span],
+            kvlen=spec["kvlen"][:span],
+            ring_slots=spec["ring"],
+            verify_cu=spec["cu"],
+            verify_token_to_req=spec["t2r"][:span],
+        )
+        batch.fla_metadata = FLAMetadata(
+            cu_seqlens=spec["cu"], cache_indices=spec["slot"], has_initial_state=spec["has_init"],
+        )
+
+    @staticmethod
+    def _linear_slot(req) -> int:
+        slot = getattr(req, "linear_slot_idx", None)
+        return req.table_idx if slot is None else slot
+
+    def prepare_for_spec_capture(self, batch: "Batch") -> None:
+        req = batch.padded_reqs[0]
+        self._stage_spec_verify(batch, req.table_idx, self._linear_slot(req), 0)
+
+    def prepare_for_spec_replay(self, batch: "Batch") -> None:
+        if len(batch.reqs) != 1:
+            raise RuntimeError("the GLM verify graph serves one request")
+        req = batch.reqs[0]
+        self._stage_spec_verify(batch, req.table_idx, self._linear_slot(req), req.cached_len)
 
     # ----- model-family hooks -----------------------------------------------------------
     def _model_args(self, config: "ModelConfig"):
@@ -87,8 +157,8 @@ class Glm5NextDSABackend(DSAAttnBackend):
 
     def _build_index_slots(self, args, config: "ModelConfig") -> None:
         # No IndexShare: every DSA layer owns its indexer and is its own leader.
-        for lid in args.dsa_layer_ids:
-            if lid >= config.num_layers:
+        for lid in tuple(args.dsa_layer_ids) + tuple(args.mtp_layer_ids):
+            if lid >= config.num_layers and lid not in args.mtp_layer_ids:
                 continue
             self._idx_slot[lid] = len(self._idx_slot)
             self._leader[lid] = lid
@@ -103,13 +173,20 @@ class Glm5NextDSABackend(DSAAttnBackend):
         forwards: a capture batch runs its warmup and its capture through ONE
         metadata object, and a cached plan would bake the warmup's (non-graph-pool)
         tensor addresses into the graph (QSA precedent)."""
-        if slot != 0 and md.kpool_plan is not None:
+        capturing = torch.cuda.is_current_stream_capturing()
+        # Slot 0 is not always in the forward: the MTP layer's graphs hold only its own slot,
+        # so reusing the warmup's plan would bake freed eager tensors into the capture.
+        if slot != 0 and md.kpool_plan is not None and md.kpool_plan_in_graph == capturing:
             return md.kpool_plan
         kp = self.kpool
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
         t = out_loc.numel()
-        if md.is_decode:
+        if md.verify_cu is not None:
+            ring_slots = md.ring_slots
+            token_to_req = md.verify_token_to_req
+            cu_seqlens = md.verify_cu
+        elif md.is_decode:
             # One token per request. ring_slots is the backend's STATIC buffer under
             # graphs (restaged per replay in _stage_decode); eager reads the
             # scheduler-staged active_table_idx. arange shapes are fixed per capture.
@@ -147,6 +224,7 @@ class Glm5NextDSABackend(DSAAttnBackend):
             torch.int32
         )
         md.kpool_plan = KpoolPlan(cmp_rows, ring_rows, ring_slots, token_to_req, cu_seqlens)
+        md.kpool_plan_in_graph = capturing
         return md.kpool_plan
 
     def _store_index(self, inputs, batch: "Batch", layer_id: int) -> None:
@@ -176,6 +254,11 @@ class Glm5NextDSABackend(DSAAttnBackend):
         # exactly the ones a straddling group just consumed.
         qsa_store_rows(tail_k, plan.ring_rows, k)
         qsa_store_rows(tail_g, plan.ring_rows, gate)
+        journal = getattr(batch, "spec_journal", None)
+        if journal is not None:
+            # A verify's rejected rows also land in the ring; commit restores the ring
+            # and re-stores only the accepted rows from these.
+            journal.index.append((slot, k, gate))
 
     # ----- selection: pools -> token rows + tail ------------------------------------------
     def _expand_and_tail(

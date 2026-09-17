@@ -402,7 +402,7 @@ class GraphRunner:
                         with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                             self.spec_buffer.logits[:tokens] = model.forward()
                         self._reset_moe_offload_cache()
-                    if shared_carry is None and adaptive_single_req:
+                    if shared_carry is None and adaptive_single_req and batch.spec_carry_states:
                         # Spans are descending, so this is the maximum graph. Its
                         # captured outputs become the one persistent journal backing
                         # all remaining prefix graphs.
@@ -421,6 +421,10 @@ class GraphRunner:
                     if adaptive_single_req and bs == 1:
                         cost_ms = self._profile_graph_ms(graph)
                         self.spec_verify_cost_curve.append((span, cost_ms))
+
+            capture_draft = getattr(model, "capture_draft_graphs", None)
+            if capture_draft is not None:
+                capture_draft(self.stream, pool, self.dummy_req, self.spec_span, self._reset_moe_offload_cache)
 
             if self.spec_verify_cost_curve:
                 # vLLM makes profiled costs nondecreasing before scheduling. Sampling
@@ -450,6 +454,9 @@ class GraphRunner:
             and key in self.spec_graph_map
             and batch.padded_size == batch.size
         )
+
+    def can_use_spec_cuda_graph_span(self, batch: Batch, span: int) -> bool:
+        return (batch.padded_size, span) in self.spec_graph_map and batch.padded_size == batch.size
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)

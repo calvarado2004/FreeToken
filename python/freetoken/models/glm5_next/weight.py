@@ -168,9 +168,9 @@ def _iter_kda_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
     yield f"{dst}.o_norm.weight", reader.get(f"{src}.o_norm.weight").to(torch.bfloat16)
 
 
-def _iter_dsa_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
+def _iter_dsa_layer(reader, layer: int, dst_layer: str | None = None) -> Iterator[tuple[str, torch.Tensor]]:
     src = f"{_CKPT}.layers.{layer}.self_attn"
-    dst = f"{_MODEL}.layers.{layer}.self_attn"
+    dst = f"{dst_layer or f'{_MODEL}.layers.{layer}'}.self_attn"
     for proj, split in (("q_a_proj", None), ("q_b_proj", 0), ("kv_a_proj_with_mqa", None), ("kv_b_proj", 0), ("o_proj", 1)):
         yield from _proj(reader, f"{src}.{proj}", f"{dst}.{proj}", split)
     for norm in ("q_a_layernorm", "kv_a_layernorm"):
@@ -187,6 +187,85 @@ def _iter_dsa_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
         ("index_kpool_compress_ape", torch.float32),
     ):
         yield f"{dst}.indexer.{part}", reader.get(f"{src}.indexer.{part}").to(dtype)
+
+
+def _iter_mtp_layer(reader, layer: int, dst: str) -> Iterator[tuple[str, torch.Tensor]]:
+    """One MTP layer's non-expert tensors (all bf16 in the checkpoint), sharded like a DSA
+    decoder layer: the input fusion and every norm replicate, attention and the shared expert
+    split per rank."""
+    src = f"{_CKPT}.layers.{layer}"
+    for name in ("enorm", "hnorm", "input_layernorm", "post_attention_layernorm", "shared_head.norm"):
+        yield f"{dst}.{name}.weight", reader.get(f"{src}.{name}.weight").to(torch.bfloat16)
+    yield from _proj(reader, f"{src}.eh_proj", f"{dst}.eh_proj")
+    yield from _iter_dsa_layer(reader, layer, dst)
+    yield f"{dst}.mlp.gate.weight", reader.get(f"{src}.mlp.gate.weight").to(torch.bfloat16)
+    yield f"{dst}.mlp.e_score_correction_bias", reader.get(f"{src}.mlp.gate.e_score_correction_bias").to(torch.float32)
+    for proj, split in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1)):
+        yield from _proj(reader, f"{src}.mlp.shared_experts.{proj}", f"{dst}.mlp.shared_experts.{proj}", split)
+
+
+_E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_FP8_E4M3_MAX = 448.0
+
+
+def quantize_nvfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``w [O, I]`` -> ModelOpt-kind NVFP4 ``(weight [O, I//2] uint8, weight_scale [O, I//16]
+    e4m3, weight_scale_2 [] float)`` with ``w ~= E2M1[code] * scale * global`` -- the layout
+    and dequant the NVFP4 banks read (low nibble first, 16-wide blocks, dequant-side global)."""
+    w = w.float()
+    out_dim, in_dim = w.shape
+    assert in_dim % 16 == 0, in_dim
+    global_scale = (w.abs().amax() / (6.0 * _FP8_E4M3_MAX)).clamp(min=1e-12)
+    blocks = w.view(out_dim, in_dim // 16, 16)
+    block_scale = (blocks.abs().amax(-1) / (6.0 * global_scale)).clamp(max=_FP8_E4M3_MAX)
+    block_scale = block_scale.to(torch.float8_e4m3fn)
+    step = block_scale.float().unsqueeze(-1) * global_scale
+    scaled = torch.where(step > 0, blocks / step, torch.zeros_like(blocks))
+    grid = torch.tensor(_E2M1_GRID, device=w.device)
+    magnitude = (scaled.abs().unsqueeze(-1) - grid).abs().argmin(-1)
+    codes = (magnitude | (scaled < 0).to(magnitude.dtype) << 3).to(torch.uint8).view(out_dim, in_dim)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed.contiguous(), block_scale, global_scale
+
+
+def _dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor, block: int = 128) -> torch.Tensor:
+    out_dim, in_dim = weight.shape
+    s = scale.float().repeat_interleave(block, 0).repeat_interleave(block, 1)[:out_dim, :in_dim]
+    return weight.float() * s
+
+
+def iter_mtp_expert_pieces(model_path: str, config, device: torch.device | None = None):
+    """The MTP layers' routed experts as NVFP4 pieces for their bank layers.
+
+    The RedHatAI export stores them block-FP8 (``weight`` + a 128x128 ``weight_scale``) while every
+    decoder layer is NVFP4, and one offload cache holds one format. They are dequantized and
+    re-quantized to NVFP4 at load; a slightly coarser drafter only lowers acceptance, never the
+    target's output, because every draft is verified. Pieces are cut per TP rank like the rest."""
+    from freetoken.models.nvfp4_banks import shard_nvfp4_piece
+
+    args: Glm5NextArgs = config.glm5_args
+    tp = get_tp_info()
+    folder = download_hf_weight(model_path)
+    with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+        weight_map = json.load(f)["weight_map"]
+    reader = _ShardReader(folder, weight_map, torch.device("cpu"))
+    work = device if device is not None else (torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu"))
+    try:
+        for layer in args.mtp_layer_ids:
+            bank = layer - config.first_k_dense_replace
+            for e in tqdm(range(config.num_experts), desc=f"Converting MTP layer {layer} experts to NVFP4", disable=not tp.is_primary()):
+                piece: dict[str, torch.Tensor] = {}
+                for proj, role in (("gate_proj", "gate"), ("up_proj", "up"), ("down_proj", "down")):
+                    src = f"{_CKPT}.layers.{layer}.mlp.experts.{e}.{proj}"
+                    w = _dequant_fp8_block(reader.get(f"{src}.weight").to(work), reader.get(f"{src}.weight_scale").to(work))
+                    packed, scale, global_scale = quantize_nvfp4(w)
+                    del w
+                    piece[role] = shard_nvfp4_piece(role, packed.cpu(), rank=tp.rank, tp_size=tp.size).unsqueeze(0)
+                    piece[f"{role}_scale"] = shard_nvfp4_piece(f"{role}_scale", scale.cpu(), rank=tp.rank, tp_size=tp.size).unsqueeze(0)
+                    piece[f"{role}_global"] = global_scale.to(torch.float16).cpu().reshape(1, 1)
+                yield bank, e, e + 1, piece
+    finally:
+        reader.close()
 
 
 def _iter_vision(reader, weight_map: dict) -> Iterator[tuple[str, torch.Tensor]]:
@@ -253,6 +332,9 @@ def iter_weights(
                 for proj, split in (("gate_proj", 0), ("up_proj", 0), ("down_proj", 1)):
                     yield from _proj(reader, f"{src}.mlp.shared_experts.{proj}", f"{dst}.mlp.shared_experts.{proj}", split)
 
+        for k, layer in enumerate(args.mtp_layer_ids):
+            yield from _iter_mtp_layer(reader, layer, f"mtp_layers.{k}")
+
         yield f"{_MODEL}.embed_tokens.weight", _shard_vocab(reader.get(
             f"{_CKPT}.embed_tokens.weight"
         )).to(torch.bfloat16)
@@ -277,7 +359,22 @@ def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple
 
 
 def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
-    """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their ``_scale`` companions; other kinds use the generic readers."""
+    """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their ``_scale`` companions; other kinds use the generic readers.
+
+    NVFP4 with MTP enabled: the generic NVFP4 reader serves the decoder banks (it is handed a
+    config without the MTP banks, which it would otherwise expect in NVFP4) and the MTP layers'
+    experts follow, converted by ``iter_mtp_expert_pieces``."""
+    if kind is QuantKind.NVFP4 and config.glm5_args.mtp_layer_ids and config.extra_moe_layers:
+        import dataclasses
+        import itertools
+
+        from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
+
+        decoder_only = dataclasses.replace(config, extra_moe_layers=0)
+        base = iter_nvfp4_expert_pieces(
+            model_path, decoder_only, nvfp4_expert_spec(model_path, config), parallel=bool(parallel), workers=workers, chunk=chunk
+        )
+        return itertools.chain(base, iter_mtp_expert_pieces(model_path, config))
     if kind is not QuantKind.FP8_BLOCK:
         return None
     if get_tp_info().size > 1:
