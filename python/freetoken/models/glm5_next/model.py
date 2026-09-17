@@ -61,6 +61,8 @@ _MTP_GRAPHS = os.environ.get("FREETOKEN_GLM_MTP_GRAPHS", "1") != "0"
 # FREETOKEN_GLM_MTP_GRAPH_MOE=1 captures the MTP MoE inside the graph too; by default the graph
 # ends before the experts and the MoE, head norm and logits run eagerly.
 _MTP_GRAPH_MOE = os.environ.get("FREETOKEN_GLM_MTP_GRAPH_MOE", "0") == "1"
+# FREETOKEN_GLM_MTP_GRAPH_SPLIT=1 (debug): two graphs per span, input projection then attention.
+_MTP_GRAPH_SPLIT = os.environ.get("FREETOKEN_GLM_MTP_GRAPH_SPLIT", "0") == "1"
 
 
 class Glm5NextDecoderLayer(BaseOP):
@@ -203,12 +205,15 @@ class Glm5NextMTPLayer(BaseOP):
 
     def pre_moe(self, embeds: torch.Tensor, positions: torch.Tensor, prev_hidden: torch.Tensor):
         """Everything up to the experts: (residual stream, the MoE's normed input)."""
-        embeds = embeds.masked_fill((positions == 0).view(-1, 1), 0.0)
-        x = self.eh_proj.forward(
-            torch.cat([self.enorm.forward(embeds), self.hnorm.forward(prev_hidden)], dim=-1)
-        )
+        x = self.project_input(embeds, positions, prev_hidden)
         x = x + self.self_attn.forward(self.input_layernorm.forward(x))
         return x, self.post_attention_layernorm.forward(x)
+
+    def project_input(self, embeds: torch.Tensor, positions: torch.Tensor, prev_hidden: torch.Tensor):
+        embeds = embeds.masked_fill((positions == 0).view(-1, 1), 0.0)
+        return self.eh_proj.forward(
+            torch.cat([self.enorm.forward(embeds), self.hnorm.forward(prev_hidden)], dim=-1)
+        )
 
     def post_moe(self, x: torch.Tensor, moe_out: torch.Tensor) -> torch.Tensor:
         return self.shared_head.forward(x + moe_out)
@@ -510,6 +515,17 @@ class Glm5NextForCausalLM(BaseLLMModel):
                         out = self._mtp_rows(*args)
                         logits = self.full_logits(out[span - 1 : span])
                     entry = (graph, out, logits)
+                elif _MTP_GRAPH_SPLIT:
+                    x0 = mtp.project_input(self.model.embed_tokens.forward(args[0]), args[1], args[2])
+                    with torch.cuda.graph(graph, pool=pool, stream=stream):
+                        x0 = mtp.project_input(self.model.embed_tokens.forward(args[0]), args[1], args[2])
+                    x_in = torch.zeros_like(x0)
+                    x_in.copy_(x0)
+                    mtp.self_attn.forward(mtp.input_layernorm.forward(x_in))
+                    graph2 = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph2, pool=pool, stream=stream):
+                        attn = mtp.self_attn.forward(mtp.input_layernorm.forward(x_in))
+                    entry = (graph, x0, (graph2, x_in, attn))
                 else:
                     mtp.pre_moe(self.model.embed_tokens.forward(args[0]), args[1], args[2])
                     with torch.cuda.graph(graph, pool=pool, stream=stream):
@@ -547,10 +563,24 @@ class Glm5NextForCausalLM(BaseLLMModel):
         try:
             backend._stage_spec_verify(batch, req.table_idx, slot, start + lo)
             graph.replay()
+            if _MTP_GRAPH_SPLIT:
+                torch.cuda.synchronize()
+                logger.info_rank0(f"MTP split graph: projection replay ok (span {span})")
+                graph2, x_in, attn = second
+                x_in[:span].copy_(first[:span])
+                graph2.replay()
+                torch.cuda.synchronize()
+                logger.info_rank0(f"MTP split graph: attention replay ok (span {span})")
         finally:
             batch.input_ids, batch.attn_metadata, batch.fla_metadata = saved
         if _MTP_GRAPH_MOE:
             out, logits = first, second
+        elif _MTP_GRAPH_SPLIT:
+            mtp = self.mtp_layers.op_list[0]
+            graph2, x_in, attn = second
+            x = x_in[:span] + attn[:span]
+            out = mtp.post_moe(x, mtp.mlp.forward(mtp.post_attention_layernorm.forward(x)))
+            logits = self.full_logits(out[span - 1 : span])
         else:
             mtp = self.mtp_layers.op_list[0]
             out = mtp.post_moe(first[:span], mtp.mlp.forward(second[:span].clone()))
