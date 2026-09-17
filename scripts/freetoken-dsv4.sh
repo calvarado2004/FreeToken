@@ -36,6 +36,10 @@ MOE_CACHE_SIZE="${MOE_CACHE_SIZE:-}"
 NUM_PAGES="${NUM_PAGES:-}"
 # KV-token floor held back before --moe-cache-auto fills the GPU with experts (engine default 8192).
 KV_RESERVE_TOKENS="${KV_RESERVE_TOKENS:-}"
+# Sampling defaults for requests that set none (a request's own values win).
+DEFAULT_TEMPERATURE="${DEFAULT_TEMPERATURE:-}"
+DEFAULT_TOP_P="${DEFAULT_TOP_P:-}"
+DEFAULT_TOP_K="${DEFAULT_TOP_K:-}"
 # SPECULATIVE_DSPARK=0 turns OFF the checkpoint's dSpark drafter (the mtp.* stack).
 # On by default: the draft/verify loop is wired, and dSpark is what the checkpoint was
 # trained to decode with. It costs 9.5 GiB of host expert banks and a slice of the GPU
@@ -163,6 +167,10 @@ cmd_start() {
     [ -n "$MOE_CACHE_SIZE" ] && cache_geometry+=(--moe-cache-size "$MOE_CACHE_SIZE")
     [ -n "$NUM_PAGES" ] && cache_geometry+=(--num-pages "$NUM_PAGES")
     [ -n "$KV_RESERVE_TOKENS" ] && cache_geometry+=(--kv-reserve-tokens "$KV_RESERVE_TOKENS")
+    local sampling=()
+    [ -n "$DEFAULT_TEMPERATURE" ] && sampling+=(--default-temperature "$DEFAULT_TEMPERATURE")
+    [ -n "$DEFAULT_TOP_P" ] && sampling+=(--default-top-p "$DEFAULT_TOP_P")
+    [ -n "$DEFAULT_TOP_K" ] && sampling+=(--default-top-k "$DEFAULT_TOP_K")
 
     echo "starting $MODEL_LABEL with HTTPS on $HOST:$PORT (TP=$TP_SIZE, memory-ratio $MEMORY_RATIO${spec:+, dSpark drafter}${MOE_CACHE_SIZE:+, MoE slots $MOE_CACHE_SIZE}${NUM_PAGES:+, KV pages $NUM_PAGES}${MOE_HYBRID_FETCH_FRACTION:+, hybrid fetch $MOE_HYBRID_FETCH_FRACTION})"
     : > "$LOG"
@@ -179,6 +187,7 @@ cmd_start() {
         --max-prefill-length "$MAX_PREFILL_LENGTH"
         --expert-load "$EXPERT_LOAD"
         "${cache_geometry[@]}"
+        "${sampling[@]}"
         "${hybrid_fraction[@]}"
         "${spec[@]}"
         "${fallback[@]}"

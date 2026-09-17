@@ -987,11 +987,22 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)
+    operator_sampling = {
+        key: value
+        for key, value in (
+            ("temperature", getattr(config, "default_temperature", None)),
+            ("top_p", getattr(config, "default_top_p", None)),
+            ("top_k", getattr(config, "default_top_k", None)),
+        )
+        if value is not None
+    }
+    if operator_sampling:
+        _MODEL_SAMPLING = {**_MODEL_SAMPLING, **operator_sampling}
     # Always surface the effective default sampling (model-recommended where available,
     # else framework defaults), since unspecified request fields resolve to these.
     logger.info(
         "Default sampling config (source=%s): temperature=%s, top_k=%s, top_p=%s",
-        "model" if _MODEL_SAMPLING else "framework",
+        ("server" if operator_sampling else "model") if _MODEL_SAMPLING else "framework",
         _MODEL_SAMPLING.get("temperature", 0.0),
         _MODEL_SAMPLING.get("top_k", -1),
         _MODEL_SAMPLING.get("top_p", 1.0),
