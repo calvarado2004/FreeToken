@@ -125,3 +125,28 @@ def test_verify_commit_matches_token_by_token_decode(rig, start, accepted, mode)
     for t in range(start + accepted + 1, total):
         _rig._batch(ctx, ids[t : t + 1], t, "decode")
         _close(model.forward().float()[0], ref_logits[t - start], f"decode at {t} after commit")
+
+
+def test_kpool_plan_is_rebuilt_inside_a_capture(rig):
+    """A cached write plan built eagerly (a capture's warmup) must not be reused by the captured
+    forward: its tensors live outside the graph pool and are freed after capture. The MTP draft
+    graphs hold only the MTP indexer slot, so no slot 0 rebuilds it for them."""
+    model, ctx = rig
+    _rig._reset(ctx)
+    batch = _rig._batch(ctx, [1, 2, 3], 8, "prefill")
+    ctx.attn_backend.prepare_for_spec_replay(batch)
+    md = batch.attn_metadata
+    backend = ctx.attn_backend
+
+    eager = backend._plan_kpool_writes(md, batch, slot=1)
+    assert backend._plan_kpool_writes(md, batch, slot=1) is eager  # same forward reuses it
+    assert md.kpool_plan_in_graph is False
+
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        with torch.cuda.graph(graph, stream=stream):
+            captured = backend._plan_kpool_writes(md, batch, slot=1)
+    torch.cuda.current_stream().wait_stream(stream)
+    assert captured is not eager
+    assert md.kpool_plan_in_graph is True
