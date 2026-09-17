@@ -66,6 +66,9 @@ _MTP_GRAPH_SPLIT = os.environ.get("FREETOKEN_GLM_MTP_GRAPH_SPLIT", "0") == "1"
 # FREETOKEN_GLM_MTP_RANK_CHECK=1 (debug): every MTP forward asserts all TP ranks agree on its
 # shape-deciding host values; a mismatch would pair collectives of different sizes.
 _MTP_RANK_CHECK = os.environ.get("FREETOKEN_GLM_MTP_RANK_CHECK", "0") == "1"
+# FREETOKEN_GLM_MTP_STAGED_EAGER=1 (debug): keep the graphs' decode-shaped staging but run the
+# layer eagerly instead of replaying, to tell a data fault from a replay fault.
+_MTP_STAGED_EAGER = os.environ.get("FREETOKEN_GLM_MTP_STAGED_EAGER", "0") == "1"
 
 
 def _assert_ranks_agree(tag: str, *values) -> None:
@@ -584,6 +587,21 @@ class Glm5NextForCausalLM(BaseLLMModel):
         slot = req.linear_slot_idx if getattr(req, "linear_slot_idx", None) is not None else req.table_idx
         try:
             backend._stage_spec_verify(batch, req.table_idx, slot, start + lo)
+            if _MTP_STAGED_EAGER:
+                mtp = self.mtp_layers.op_list[0]
+                saved_pos, saved_loc = batch.positions, batch.out_loc
+                batch.positions, batch.out_loc = buf["positions"][:span], buf["out_loc"][:span]
+                try:
+                    x, normed = mtp.pre_moe(
+                        self.model.embed_tokens.forward(buf["tokens"][:span]), buf["positions"][:span], buf["hidden"][:span]
+                    )
+                    torch.cuda.synchronize()
+                finally:
+                    batch.positions, batch.out_loc = saved_pos, saved_loc
+                out = mtp.post_moe(x, mtp.mlp.forward(normed))
+                logits = self.full_logits(out[span - 1 : span])
+                batch.input_ids, batch.attn_metadata, batch.fla_metadata = saved
+                return out, logits
             graph.replay()
             if _MTP_GRAPH_SPLIT:
                 torch.cuda.synchronize()
