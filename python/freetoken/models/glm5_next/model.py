@@ -58,6 +58,9 @@ _MTP_PROBE_EXACT = os.environ.get("FREETOKEN_GLM_MTP_PROBE_EXACT", "0") == "1"
 _MTP_GRAPH_CHECK = int(os.environ.get("FREETOKEN_GLM_MTP_GRAPH_CHECK", "0") or 0)
 # FREETOKEN_GLM_MTP_GRAPHS=0: run the MTP layer eagerly (no draft graphs).
 _MTP_GRAPHS = os.environ.get("FREETOKEN_GLM_MTP_GRAPHS", "1") != "0"
+# FREETOKEN_GLM_MTP_GRAPH_MOE=1 captures the MTP MoE inside the graph too; by default the graph
+# ends before the experts and the MoE, head norm and logits run eagerly.
+_MTP_GRAPH_MOE = os.environ.get("FREETOKEN_GLM_MTP_GRAPH_MOE", "0") == "1"
 
 
 class Glm5NextDecoderLayer(BaseOP):
@@ -195,15 +198,20 @@ class Glm5NextMTPLayer(BaseOP):
     def forward(
         self, embeds: torch.Tensor, positions: torch.Tensor, prev_hidden: torch.Tensor, moe=None,
     ) -> torch.Tensor:
+        x, normed = self.pre_moe(embeds, positions, prev_hidden)
+        return self.post_moe(x, (moe or self.mlp.forward)(normed))
+
+    def pre_moe(self, embeds: torch.Tensor, positions: torch.Tensor, prev_hidden: torch.Tensor):
+        """Everything up to the experts: (residual stream, the MoE's normed input)."""
         embeds = embeds.masked_fill((positions == 0).view(-1, 1), 0.0)
         x = self.eh_proj.forward(
             torch.cat([self.enorm.forward(embeds), self.hnorm.forward(prev_hidden)], dim=-1)
         )
-        residual = x
-        x = residual + self.self_attn.forward(self.input_layernorm.forward(x))
-        residual = x
-        x = residual + (moe or self.mlp.forward)(self.post_attention_layernorm.forward(x))
-        return self.shared_head.forward(x)
+        x = x + self.self_attn.forward(self.input_layernorm.forward(x))
+        return x, self.post_attention_layernorm.forward(x)
+
+    def post_moe(self, x: torch.Tensor, moe_out: torch.Tensor) -> torch.Tensor:
+        return self.shared_head.forward(x + moe_out)
 
 
 class _ExactMTPExperts:
@@ -493,14 +501,25 @@ class Glm5NextForCausalLM(BaseLLMModel):
             buf["positions"][:span].copy_(torch.arange(span, dtype=torch.int32, device=dev))
             stage(batch, dummy_req.table_idx, slot, 0)
             graph = torch.cuda.CUDAGraph()
+            mtp = self.mtp_layers.op_list[0]
+            args = (buf["tokens"][:span], buf["positions"][:span], buf["hidden"][:span])
             with ctx.forward_batch(batch):
-                self._mtp_rows(buf["tokens"][:span], buf["positions"][:span], buf["hidden"][:span])
-                with torch.cuda.graph(graph, pool=pool, stream=stream):
-                    out = self._mtp_rows(buf["tokens"][:span], buf["positions"][:span], buf["hidden"][:span])
-                    logits = self.full_logits(out[span - 1 : span])
+                if _MTP_GRAPH_MOE:
+                    self._mtp_rows(*args)
+                    with torch.cuda.graph(graph, pool=pool, stream=stream):
+                        out = self._mtp_rows(*args)
+                        logits = self.full_logits(out[span - 1 : span])
+                    entry = (graph, out, logits)
+                else:
+                    mtp.pre_moe(self.model.embed_tokens.forward(args[0]), args[1], args[2])
+                    with torch.cuda.graph(graph, pool=pool, stream=stream):
+                        x, normed = mtp.pre_moe(self.model.embed_tokens.forward(args[0]), args[1], args[2])
+                    entry = (graph, x, normed)
                 reset_moe()
-            self._mtp_graphs[span] = (graph, out, logits)
-        logger.info_rank0(f"Captured MTP draft graphs for 1..{max_span} rows")
+            self._mtp_graphs[span] = entry
+        logger.info_rank0(
+            f"Captured MTP draft graphs for 1..{max_span} rows ({'with' if _MTP_GRAPH_MOE else 'without'} the MoE)"
+        )
 
     def _mtp_run(self, batch, start: int, lo: int, hi: int, tokens: torch.Tensor, hidden: torch.Tensor):
         """MTP output rows and last-row logits for positions ``start+lo .. start+hi-1`` of the
@@ -514,7 +533,7 @@ class Glm5NextForCausalLM(BaseLLMModel):
                 with self._rows(batch, start, lo, hi):
                     out = self._mtp_rows(tokens, batch.positions, hidden)
             return out, self.full_logits(out[span - 1 : span])
-        graph, out, logits = entry
+        graph, first, second = entry
         buf = self._mtp_buf
         req = batch.reqs[0]
         buf["tokens"][:span].copy_(tokens)
@@ -530,6 +549,12 @@ class Glm5NextForCausalLM(BaseLLMModel):
             graph.replay()
         finally:
             batch.input_ids, batch.attn_metadata, batch.fla_metadata = saved
+        if _MTP_GRAPH_MOE:
+            out, logits = first, second
+        else:
+            mtp = self.mtp_layers.op_list[0]
+            out = mtp.post_moe(first[:span], mtp.mlp.forward(second[:span].clone()))
+            logits = self.full_logits(out[span - 1 : span])
         if self._mtp_check_left > 0:
             self._mtp_check_left -= 1
             with self._rows(batch, start, lo, hi):
