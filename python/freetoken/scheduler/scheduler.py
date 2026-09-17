@@ -494,8 +494,9 @@ class Scheduler(SchedulerIOMixin):
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
         )
-        if reply:
-            accepted, drafted, blocks, per_pos = self.status_reporter.spec_totals
+        totals = getattr(self.status_reporter, "spec_totals", None)
+        if reply and totals is not None:
+            accepted, drafted, blocks, per_pos = totals
             if blocks:
                 for m in reply:
                     m.spec_accepted_total = accepted
